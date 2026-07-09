@@ -1,0 +1,64 @@
+#!/bin/bash
+
+# ==========================================
+# Run MELODIC for all subjects and sessions
+# ==========================================
+
+set -e
+
+# Base directories
+DATA_DIR="/path/to/data"
+OUTPUT_DIR="/path/to/output"
+
+# Subjects
+subjects=("P01" "P02" "P03")
+
+# Sessions
+sessions=("S1" "S2" "S3" "S4" "S5" "S6" "S7" "S8")
+
+# Loop through every subject
+for subject in "${subjects[@]}"
+do
+
+    echo "Processing $subject"
+
+    # Loop through every session
+    for session in "${sessions[@]}"
+    do
+
+        func="${DATA_DIR}/${subject}/${session}/func.nii.gz"
+        mask="${DATA_DIR}/${subject}/${session}/mask.nii.gz"
+
+        out="${OUTPUT_DIR}/${subject}/${session}/melodic"
+
+        # Check functional image exists
+        if [ ! -f "$func" ]; then
+            echo "Missing functional image:"
+            echo "$func"
+            continue
+        fi
+
+        # Check mask exists
+        if [ ! -f "$mask" ]; then
+            echo "Missing mask:"
+            echo "$mask"
+            continue
+        fi
+
+        mkdir -p "$out"
+
+        echo "Running MELODIC..."
+
+        melodic \
+            -i "$func" \
+            -o "$out" \
+            -m "$mask" \
+            --tr=2.0 \
+            --report \
+            --nobet
+
+    done
+
+done
+
+echo "Finished."
