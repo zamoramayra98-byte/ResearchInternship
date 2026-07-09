@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+
+from pathlib import Path
+
+import nibabel as nib
+import numpy as np
+import pandas as pd
+
+
+# ----------------------------------------
+# Load ICA spatial maps
+# ----------------------------------------
+
+def load_spatial_maps(melodic_directory):
+
+    maps = nib.load(
+        Path(melodic_directory) / "melodic_IC.nii.gz"
+    )
+
+    return maps
+
+
+# ----------------------------------------
+# Load ICA time series
+# ----------------------------------------
+
+def load_time_series(melodic_directory):
+
+    return np.loadtxt(
+        Path(melodic_directory) / "melodic_mix"
+    )
+
+
+# ----------------------------------------
+# Load CO2 recording
+# ----------------------------------------
+
+def load_co2(file):
+
+    return pd.read_csv(file)
+
+
+# ----------------------------------------
+# Main
+# ----------------------------------------
+
+def main():
+
+    melodic_directory = "Results/P01/S1/melodic"
+
+    co2_file = "CO2/P01_S1.csv"
+
+    spatial_maps = load_spatial_maps(
+        melodic_directory
+    )
+
+    ica_time_series = load_time_series(
+        melodic_directory
+    )
+
+    co2 = load_co2(co2_file)
+
+    print(spatial_maps.shape)
+
+    print(ica_time_series.shape)
+
+    print(co2.head())
+
+
+if __name__ == "__main__":
+
+    main()
