@@ -1,0 +1,95 @@
+#!/bin/bash
+
+# ==========================================
+# Concatenate sessions and run MELODIC
+# ==========================================
+
+set -e
+
+# Base directories
+DATA_DIR="/path/to/data"
+OUTPUT_DIR="/path/to/output"
+
+# Optional: set maximum number of ICA components.
+# Leave empty ("") to allow MELODIC to estimate the dimensionality.
+MAX_COMPONENTS=""
+
+# Subjects
+subjects=("P01" "P02" "P03")
+
+# Sessions
+sessions=("S1" "S2" "S3" "S4" "S5" "S6" "S7" "S8")
+
+# Loop through each subject
+for subject in "${subjects[@]}"
+do
+
+    echo "Processing ${subject}"
+
+    subject_out="${OUTPUT_DIR}/${subject}"
+    mkdir -p "${subject_out}"
+
+    func_list=()
+
+    # -----------------------------
+    # Collect all sessions
+    # -----------------------------
+    for session in "${sessions[@]}"
+    do
+
+        func="${DATA_DIR}/${subject}/${session}/func.nii.gz"
+
+        if [ ! -f "$func" ]; then
+            echo "Missing functional image: $func"
+            continue
+        fi
+
+        func_list+=("$func")
+
+    done
+
+    # -----------------------------
+    # Ensure sufficient sessions
+    # -----------------------------
+    if [ ${#func_list[@]} -lt 2 ]; then
+        echo "Not enough sessions for ${subject}"
+        continue
+    fi
+
+    # -----------------------------
+    # Concatenate sessions
+    # -----------------------------
+    concatenated="${subject_out}/concatenated_func.nii.gz"
+
+    echo "Concatenating sessions..."
+
+    fslmerge -t "$concatenated" "${func_list[@]}"
+
+    # -----------------------------
+    # Build MELODIC command
+    # -----------------------------
+    melodic_cmd=(
+        melodic
+        -i "$concatenated"
+        -o "${subject_out}/melodic"
+        --report
+        --nobet
+    )
+
+    # Optional: fix the number of ICA components
+    if [ -n "$MAX_COMPONENTS" ]; then
+        melodic_cmd+=(--dim="$MAX_COMPONENTS")
+    fi
+
+    # -----------------------------
+    # Run MELODIC
+    # -----------------------------
+    echo "Running MELODIC..."
+
+    "${melodic_cmd[@]}"
+
+    echo "Finished ICA for ${subject}"
+
+done
+
+echo "Pipeline complete."
