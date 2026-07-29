@@ -1,0 +1,206 @@
+```dockerfile
+# ============================================================
+# Neuroimaging Docker Container
+# Ubuntu 22.04 + FSL + ANTs + AFNI
+#
+# Intended for:
+#   - FSL / MELODIC
+#   - ANTs
+#   - AFNI
+#   - MRI/fMRI preprocessing and analysis
+#
+# Visualization is performed outside the container.
+# ============================================================
+
+FROM ubuntu:22.04
+
+
+# ============================================================
+# 1. Environment variables
+# ============================================================
+
+# Location where FSL will be installed
+ENV FSLDIR=/usr/local/fsl
+
+# Prevent interactive prompts during apt installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Set language/locale
+ENV LANG=en_GB.UTF-8
+ENV LC_ALL=en_GB.UTF-8
+
+# ANTs installation location
+ENV ANTSPATH=/usr/local/ants/bin
+
+# AFNI installation location
+ENV AFNIPATH=/usr/local/afni
+
+
+# ============================================================
+# 2. Install system dependencies
+# ============================================================
+
+RUN apt-get update -y && \
+    apt-get upgrade -y && \
+    apt-get install -y --no-install-recommends \
+        python3 \
+        python3-pip \
+        wget \
+        curl \
+        ca-certificates \
+        file \
+        dc \
+        bc \
+        git \
+        unzip \
+        tar \
+        gzip \
+        bzip2 \
+        build-essential \
+        libquadmath0 \
+        libgomp1 \
+        libgtk2.0-0 \
+        libgl1 \
+        libgl1-mesa-glx \
+        libglu1-mesa-dev \
+        libxext6 \
+        libxrender1 \
+        libxi6 \
+        libxmu6 \
+        libxt6 \
+        libxpm4 \
+        tcsh \
+        less \
+        nano \
+        vim \
+        && \
+    rm -rf /var/lib/apt/lists/*
+
+
+# ============================================================
+# 3. Install FSL
+# ============================================================
+
+WORKDIR /tmp
+
+RUN wget -O fslinstaller.py \
+    https://fsl.fmrib.ox.ac.uk/fsldownloads/fslconda/releases/fslinstaller.py && \
+    python3 fslinstaller.py -d /usr/local/fsl && \
+    rm -f fslinstaller.py
+
+
+# ============================================================
+# 4. Configure FSL
+# ============================================================
+
+ENV PATH="${FSLDIR}/bin:${PATH}"
+
+RUN echo "source ${FSLDIR}/etc/fslconf/fsl.sh" >> /etc/bash.bashrc
+
+
+# ============================================================
+# 5. Install ANTs
+# ============================================================
+
+# Download the ANTs release archive.
+#
+# ANTs provides official Docker images, but installing the
+# binaries into this Ubuntu image keeps FSL, ANTs and AFNI
+# available from the same container.
+#
+# Version can be changed later if your project requires a
+# specific version.
+
+ARG ANTS_VERSION=2.5.3
+
+RUN mkdir -p /usr/local/ants && \
+    wget -O /tmp/ants.tar.gz \
+    "https://github.com/ANTsX/ANTs/releases/download/v${ANTS_VERSION}/ants-${ANTS_VERSION}-ubuntu-20.04-X86_64.tar.gz" && \
+    tar -xzf /tmp/ants.tar.gz -C /usr/local/ants --strip-components=1 && \
+    rm -f /tmp/ants.tar.gz
+
+
+# Add ANTs to PATH
+ENV PATH="${ANTSPATH}:${PATH}"
+
+
+# ============================================================
+# 6. Install AFNI
+# ============================================================
+
+# AFNI's official Docker distribution is:
+#
+#   afni/afni_make_build
+#
+# AFNI also provides pre-built Linux binaries. We use the
+# pre-built binary here rather than installing the complete
+# AFNI Docker image inside this image.
+
+ARG AFNI_VERSION=26.1.04
+
+RUN mkdir -p /usr/local/afni && \
+    wget -O /tmp/afni.tgz \
+    "https://afni.nimh.nih.gov/pub/dist/tgz/linux_ubuntu_24_64.tgz" && \
+    tar -xzf /tmp/afni.tgz -C /usr/local/afni --strip-components=1 && \
+    rm -f /tmp/afni.tgz
+
+
+# Add AFNI to PATH
+ENV PATH="${AFNIPATH}:${PATH}"
+
+
+# ============================================================
+# 7. Configure AFNI
+# ============================================================
+
+ENV AFNI_COMPRESSOR=GZIP
+ENV AFNI_AUTOGZIP=YES
+
+
+# ============================================================
+# 8. Create directories for your project
+# ============================================================
+
+RUN mkdir -p /data \
+             /output \
+             /scripts
+
+
+# ============================================================
+# 9. Verify installations during image build
+# ============================================================
+
+RUN echo "Checking FSL..." && \
+    . ${FSLDIR}/etc/fslconf/fsl.sh && \
+    which fslmaths && \
+    which fslmerge && \
+    which melodic && \
+    echo "FSL/MELODIC installation OK"
+
+
+RUN echo "Checking ANTs..." && \
+    which antsRegistration && \
+    which antsApplyTransforms && \
+    echo "ANTs installation OK"
+
+
+RUN echo "Checking AFNI..." && \
+    which 3dinfo && \
+    which 3dcalc && \
+    echo "AFNI installation OK"
+
+
+# ============================================================
+# 10. Default working directory
+# ============================================================
+
+WORKDIR /data
+
+
+# ============================================================
+# 11. Start an interactive Bash shell
+# ============================================================
+
+ENTRYPOINT ["/bin/bash", "-c", \
+    ". /usr/local/fsl/etc/fslconf/fsl.sh && exec /bin/bash"]
+```
