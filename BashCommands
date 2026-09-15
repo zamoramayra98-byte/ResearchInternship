@@ -11,15 +11,15 @@ set -e
 # 1. Define directories
 # ----------------------------------------------------
 
-DATA_DIR="/Neurodata/M3PI/derivatives/vessels/sub-02/ses-03/func"
-OUTPUT_DIR="/Neurodata/M3PI/derivatives/vessels/vessels_melodic/sub-02/ses-03"
+DATA_DIR="/Neurodata/M3PI/derivatives/vessels/${subject}/${session}/func"
+OUTPUT_DIR="/Neurodata/M3PI/Mayra_derivatives/vessels/vessels_melodic/${subject}/${session}"
 
 
 # ----------------------------------------------------
 # 2. Define subjects and sessions
 # ----------------------------------------------------
 
-subjects=("sub-01" "sub-02" "sub-03")
+subjects=("sub-01" "sub-02" "sub-03" "sub-04" "sub-05" "sub-06")
 
 sessions=("ses-01" "ses-02" "ses-03" "ses-04" "ses-05" "ses-06" "ses-07" "ses-08")
 
@@ -56,10 +56,10 @@ do
     do
 
         # Location of functional image
-        func="${DATA_DIR}/00.sub-02_ses-03_task-simon_optcom_native_preprocessed.nii.gz"
+        func="func="${DATA_DIR}/00.${subject}_${session}_task-simon_optcom_native_preprocessed.nii.gz"
 
         # Location of brain mask
-        session_mask="/Neurodata/M3PI/derivatives/vessels/sub-02/ses-03/mask.nii.gz"
+        session_mask="/Neurodata/M3PI/derivatives/vessels/${subject}/${session}/reg/sbref_brain_mask.nii.gz"
 
 
         # --------------------------------------------
