@@ -59,7 +59,6 @@ do
 
         DATA_DIR="/Neurodata/M3PI/derivatives/vessels/${subject}/${session}/func"
 
-        OUTPUT_DIR="/Neurodata/M3PI/derivatives/Mayra_derivatives/vessels/vessels_melodic/${subject}/${session}"
 
         # Location of functional image
         func="${DATA_DIR}/00.${subject}_${session}_task-simon_optcom_native_preprocessed.nii.gz"
