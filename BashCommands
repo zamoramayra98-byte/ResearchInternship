@@ -32,7 +32,7 @@ do
     echo "Processing ${subject}"
 
     # Create output directory for subject
-    subject_out="/Neurodata/M3PI/Mayra_derivatives/vessels/vessels_melodic/${subject}"
+    subject_out="/Neurodata/M3PI/derivatives/Mayra_derivatives/vessels/vessels_melodic/${subject}"
 
     mkdir -p "${subject_out}"
 
