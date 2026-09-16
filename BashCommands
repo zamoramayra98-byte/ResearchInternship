@@ -8,15 +8,7 @@ set -e
 
 
 # ----------------------------------------------------
-# 1. Define directories
-# ----------------------------------------------------
-
-DATA_DIR="/Neurodata/M3PI/derivatives/vessels/${subject}/${session}/func"
-OUTPUT_DIR="/Neurodata/M3PI/Mayra_derivatives/vessels/vessels_melodic/${subject}/${session}"
-
-
-# ----------------------------------------------------
-# 2. Define subjects and sessions
+# 1. Define subjects and sessions
 # ----------------------------------------------------
 
 subjects=("sub-01" "sub-02" "sub-03" "sub-04" "sub-05" "sub-06")
@@ -31,7 +23,7 @@ numbercomponents=20
 
 
 # ----------------------------------------------------
-# 3. Loop through each subject
+# 2. Loop through each subject
 # ----------------------------------------------------
 
 for subject in "${subjects[@]}"
@@ -40,13 +32,13 @@ do
     echo "Processing ${subject}"
 
     # Create output directory for subject
-    subject_out="${OUTPUT_DIR}/${subject}"
+    subject_out="/Neurodata/M3PI/Mayra_derivatives/vessels/vessels_melodic/${subject}"
 
     mkdir -p "${subject_out}"
 
 
     # ------------------------------------------------
-    # 4. Create an empty list for functional files
+    # 3. Create an empty list for functional files
     # ------------------------------------------------
 
     func_list=()
@@ -55,14 +47,22 @@ do
 
 
     # ------------------------------------------------
-    # 5. Loop through each session
+    # 4. Loop through each session
     # ------------------------------------------------
 
     for session in "${sessions[@]}"
     do
 
+        # ------------------------------------------------
+        # Define directories for the current subject/session
+        # ------------------------------------------------
+
+        DATA_DIR="/Neurodata/M3PI/derivatives/vessels/${subject}/${session}/func"
+
+        OUTPUT_DIR="/Neurodata/M3PI/derivatives/Mayra_derivatives/vessels/vessels_melodic/${subject}/${session}"
+
         # Location of functional image
-        func="func="${DATA_DIR}/00.${subject}_${session}_task-simon_optcom_native_preprocessed.nii.gz"
+        func="${DATA_DIR}/00.${subject}_${session}_task-simon_optcom_native_preprocessed.nii.gz"
 
         # Location of brain mask
         session_mask="/Neurodata/M3PI/derivatives/vessels/${subject}/${session}/reg/sbref_brain_mask.nii.gz"
@@ -100,7 +100,7 @@ do
 
 
     # ------------------------------------------------
-    # 6. Check number of sessions
+    # 5. Check number of sessions
     # ------------------------------------------------
 
     if [ ${#func_list[@]} -lt 2 ]; then
@@ -113,7 +113,7 @@ do
 
 
     # ------------------------------------------------
-    # 7. Check that a mask was found
+    # 6. Check that a mask was found
     # ------------------------------------------------
 
     if [ -z "$mask" ]; then
@@ -126,7 +126,7 @@ do
 
 
     # ------------------------------------------------
-    # 8. Concatenate sessions
+    # 7. Concatenate sessions
     # ------------------------------------------------
 
     concatenated="${subject_out}/concatenated_func.nii.gz"
@@ -153,7 +153,7 @@ do
     melodic_output="${subject_out}/${subject}${numbercomponents}_melodic"
 
     # ------------------------------------------------
-    # 9. Run MELODIC
+    # 8. Run MELODIC
     # ------------------------------------------------
 
     echo "Running MELODIC..."
