@@ -39,6 +39,113 @@ def load_co2(file):
 
     return pd.read_csv(file)
 
+# ----------------------------------------
+ # Prepare CO2 signal 
+# ---------------------------------------- 
+def get_co2_signal(co2): 
+
+    # Display column names so we know what is available 
+    print("\nCO2 columns:") 
+    print(co2.columns) 
+
+    # Use the first numerical column as the CO2 signal 
+    numerical_columns = co2.select_dtypes( 
+        include=np.number
+     ).columns 
+
+if len(numerical_columns) == 0: 
+
+    raise ValueError( 
+        "No numerical CO2 column was found."
+     ) 
+
+co2_signal = co2[numerical_columns[0]].to_numpy() 
+
+return co2_signal
+
+# ----------------------------------------
+# Match CO2 length to ICA time series
+# ----------------------------------------
+
+def match_lengths(ica_time_series, co2_signal):
+
+    n_ica = ica_time_series.shape[0]
+    n_co2 = len(co2_signal)
+
+    print("\nNumber of ICA time points:", n_ica)
+    print("Number of CO2 time points:", n_co2)
+
+    # If CO2 is longer, truncate it
+    if n_co2 > n_ica:
+
+        co2_signal = co2_signal[:n_ica]
+
+    # If ICA is longer, truncate ICA
+    elif n_ica > n_co2:
+
+        ica_time_series = ica_time_series[:n_co2, :]
+
+    return ica_time_series, co2_signal
+
+
+# ----------------------------------------
+# Correlate ICA components with CO2
+# ----------------------------------------
+
+def correlate_components(ica_time_series, co2_signal):
+
+    correlations = []
+
+    number_components = ica_time_series.shape[1]
+
+    for component in range(number_components):
+
+        component_signal = ica_time_series[:, component]
+
+        correlation = np.corrcoef(
+            component_signal,
+            co2_signal
+        )[0, 1]
+
+        correlations.append(correlation)
+
+    return np.array(correlations)
+
+
+# ----------------------------------------
+# Save correlation results
+# ----------------------------------------
+
+def save_results(correlations, output_file):
+
+    results = pd.DataFrame({
+
+        "component": np.arange(
+            1,
+            len(correlations) + 1
+        ),
+
+        "correlation_with_CO2": correlations,
+
+        "absolute_correlation": np.abs(
+            correlations
+        )
+
+    })
+
+    # Sort by absolute correlation
+    results = results.sort_values(
+        "absolute_correlation",
+        ascending=False
+    )
+
+    results.to_csv(
+        output_file,
+        index=False
+    )
+
+    return results
+
 
 # ----------------------------------------
 # Main
@@ -46,27 +153,177 @@ def load_co2(file):
 
 def main():
 
-    melodic_directory = "Results/P01/S1/melodic"
+    # ------------------------------------
+    # Define directories
+    # ------------------------------------
 
-    co2_file = "CO2/P01_S1.csv"
+    base_directory = Path(
+        "/Neurodata/M3PI/derivatives/Mayra_derivatives/vessels_melodic"
+    )
+
+
+    # ------------------------------------
+    # Example subject
+    # ------------------------------------
+
+    subject = "sub-01"
+
+    numbercomponents = 20
+
+
+    # MELODIC directory created by Bash
+    melodic_directory = (
+        base_directory
+        / subject
+        / f"{subject}{numbercomponents}_melodic"
+    )
+
+
+    # ------------------------------------
+    # CO2 file
+    # ------------------------------------
+
+    co2_file = Path(
+        f"/Neurodata/M3PI/CO2/{subject}.csv"
+    )
+
+
+    # ------------------------------------
+    # Check files exist
+    # ------------------------------------
+
+    if not melodic_directory.exists():
+
+        raise FileNotFoundError(
+            f"MELODIC directory not found:\n"
+            f"{melodic_directory}"
+        )
+
+
+    if not co2_file.exists():
+
+        raise FileNotFoundError(
+            f"CO2 file not found:\n"
+            f"{co2_file}"
+        )
+
+
+    # ------------------------------------
+    # Load ICA spatial maps
+    # ------------------------------------
 
     spatial_maps = load_spatial_maps(
         melodic_directory
     )
 
+
+    # ------------------------------------
+    # Load ICA time series
+    # ------------------------------------
+
     ica_time_series = load_time_series(
         melodic_directory
     )
 
-    co2 = load_co2(co2_file)
 
+    # ------------------------------------
+    # Load CO2
+    # ------------------------------------
+
+    co2 = load_co2(
+        co2_file
+    )
+
+
+    # ------------------------------------
+    # Print basic information
+    # ------------------------------------
+
+    print("\n====================================")
+    print("ICA / CO2 ANALYSIS")
+    print("====================================")
+
+    print("\nSubject:")
+    print(subject)
+
+    print("\nMELODIC directory:")
+    print(melodic_directory)
+
+    print("\nSpatial map shape:")
     print(spatial_maps.shape)
 
+    print("\nICA time series shape:")
     print(ica_time_series.shape)
 
+    print("\nCO2 data:")
     print(co2.head())
 
+
+    # ------------------------------------
+    # Extract CO2 signal
+    # ------------------------------------
+
+    co2_signal = get_co2_signal(
+        co2
+    )
+
+
+    # ------------------------------------
+    # Match lengths
+    # ------------------------------------
+
+    ica_time_series, co2_signal = match_lengths(
+        ica_time_series,
+        co2_signal
+    )
+
+
+    # ------------------------------------
+    # Calculate correlations
+    # ------------------------------------
+
+    correlations = correlate_components(
+        ica_time_series,
+        co2_signal
+    )
+
+
+    # ------------------------------------
+    # Save results
+    # ------------------------------------
+
+    output_file = (
+        melodic_directory
+        / "ICA_CO2_correlations.csv"
+    )
+
+
+    results = save_results(
+        correlations,
+        output_file
+    )
+
+
+    # ------------------------------------
+    # Display results
+    # ------------------------------------
+
+    print("\n====================================")
+    print("ICA COMPONENT / CO2 CORRELATIONS")
+    print("====================================")
+
+    print(results.to_string(index=False))
+
+
+    print("\nResults saved to:")
+    print(output_file)
+
+
+# ----------------------------------------
+# Run main
+# ----------------------------------------
 
 if __name__ == "__main__":
 
     main()
+
