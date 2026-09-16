@@ -23,6 +23,12 @@ subjects=("sub-01" "sub-02" "sub-03" "sub-04" "sub-05" "sub-06")
 
 sessions=("ses-01" "ses-02" "ses-03" "ses-04" "ses-05" "ses-06" "ses-07" "ses-08")
 
+# ----------------------------------------------------
+# Define number of ICA components
+# ----------------------------------------------------
+
+numbercomponents=20
+
 
 # ----------------------------------------------------
 # 3. Loop through each subject
@@ -141,18 +147,25 @@ do
 
 
     # ------------------------------------------------
+    # Define unique MELODIC output name
+    # ------------------------------------------------
+
+    melodic_output="${subject_out}/${subject}${numbercomponents}_melodic"
+
+    # ------------------------------------------------
     # 9. Run MELODIC
     # ------------------------------------------------
 
     echo "Running MELODIC..."
-
+    echo "Output: ${melodic_output}"
 
     melodic \
         -i "$concatenated" \
-        -o "${subject_out}/melodic" \
+        -o "$melodic_output" \
         -m "$mask" \
         --report \
         --nobet
+        --dim="$numbercomponents"
 
 
     echo "Finished ${subject}"
