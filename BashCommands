@@ -1,0 +1,180 @@
+#!/bin/bash
+
+# ====================================================
+# Multi-session ICA Pipeline
+# ====================================================
+
+set -e
+
+
+# ----------------------------------------------------
+# 1. Define subjects and sessions
+# ----------------------------------------------------
+
+subjects=("sub-01" "sub-02" "sub-03" "sub-04" "sub-05" "sub-06")
+
+sessions=("ses-01" "ses-02" "ses-03" "ses-04" "ses-05" "ses-06" "ses-07" "ses-08")
+
+# ----------------------------------------------------
+# Define number of ICA components
+# ----------------------------------------------------
+
+numbercomponents=20
+
+
+# ----------------------------------------------------
+# 2. Loop through each subject
+# ----------------------------------------------------
+
+for subject in "${subjects[@]}"
+do
+
+    echo "Processing ${subject}"
+
+    # Create output directory for subject
+    subject_out="/Neurodata/M3PI/derivatives/Mayra_derivatives/vessels/vessels_melodic/${subject}"
+
+    mkdir -p "${subject_out}"
+
+
+    # ------------------------------------------------
+    # 3. Create an empty list for functional files
+    # ------------------------------------------------
+
+    func_list=()
+
+    mask=""
+
+
+    # ------------------------------------------------
+    # 4. Loop through each session
+    # ------------------------------------------------
+
+    for session in "${sessions[@]}"
+    do
+
+        # ------------------------------------------------
+        # Define directories for the current subject/session
+        # ------------------------------------------------
+
+        DATA_DIR="/Neurodata/M3PI/derivatives/vessels/${subject}/${session}/func"
+
+
+        # Location of functional image
+        func="${DATA_DIR}/00.${subject}_${session}_task-simon_optcom_native_preprocessed.nii.gz"
+
+        # Location of brain mask
+        session_mask="/Neurodata/M3PI/derivatives/vessels/${subject}/${session}/reg/sbref_brain_mask.nii.gz"
+
+
+        # --------------------------------------------
+        # Check whether functional image exists
+        # --------------------------------------------
+
+        if [ ! -f "$func" ]; then
+
+            echo "Missing functional image:"
+            echo "$func"
+
+            continue
+
+        fi
+
+
+        # Add functional image to the list
+        func_list+=("$func")
+
+
+        # --------------------------------------------
+        # Find a brain mask
+        # --------------------------------------------
+
+        if [ -z "$mask" ] && [ -f "$session_mask" ]; then
+
+            mask="$session_mask"
+
+        fi
+
+    done
+
+
+    # ------------------------------------------------
+    # 5. Check number of sessions
+    # ------------------------------------------------
+
+    if [ ${#func_list[@]} -lt 2 ]; then
+
+        echo "Not enough sessions."
+
+        continue
+
+    fi
+
+
+    # ------------------------------------------------
+    # 6. Check that a mask was found
+    # ------------------------------------------------
+
+    if [ -z "$mask" ]; then
+
+        echo "No brain mask found for ${subject}."
+
+        continue
+
+    fi
+
+
+    # ------------------------------------------------
+    # 7. Concatenate sessions
+    # ------------------------------------------------
+
+    concatenated="${subject_out}/concatenated_func.nii.gz"
+
+    echo "Concatenating sessions..."
+
+
+    # Get TR from the first functional image
+    TR=$(fslval "${func_list[0]}" pixdim4)
+
+
+    # Combine sessions in the time dimension
+    # and preserve the correct TR
+    fslmerge -tr \
+        "$concatenated" \
+        "${func_list[@]}" \
+        "$TR"
+
+
+    # ------------------------------------------------
+    # Define unique MELODIC output name
+    # ------------------------------------------------
+
+    melodic_output="${subject_out}/${subject}${numbercomponents}_melodic"
+
+    # ------------------------------------------------
+    # 8. Run MELODIC
+    # ------------------------------------------------
+
+    echo "Running MELODIC..."
+    echo "Output: ${melodic_output}"
+
+    melodic \
+        -i "$concatenated" \
+        -o "$melodic_output" \
+        -m "$mask" \
+        --report \
+        --nobet
+        --dim="$numbercomponents"
+
+
+    echo "Finished ${subject}"
+
+
+done
+
+
+# ----------------------------------------------------
+# 10. Pipeline complete
+# ----------------------------------------------------
+
+echo "Pipeline complete."
