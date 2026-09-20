@@ -64,7 +64,7 @@ co2_signal = co2[numerical_columns[0]].to_numpy()
 return co2_signal
 
 # ----------------------------------------
-# Match CO2 length to ICA time series
+# Align CO2 and ICA time series using cross-correlation
 # ----------------------------------------
 
 def match_lengths(ica_time_series, co2_signal):
@@ -75,15 +75,58 @@ def match_lengths(ica_time_series, co2_signal):
     print("\nNumber of ICA time points:", n_ica)
     print("Number of CO2 time points:", n_co2)
 
-    # If CO2 is longer, truncate it
-    if n_co2 > n_ica:
+    # ----------------------------------------
+    # Prepare signals for cross-correlation
+    # ----------------------------------------
 
-        co2_signal = co2_signal[:n_ica]
+    # Use the mean across all ICA components
+    # as the reference ICA signal
+    ica_reference = np.mean(ica_time_series, axis=1)
 
-    # If ICA is longer, truncate ICA
-    elif n_ica > n_co2:
+    # Remove the mean from both signals
+    ica_reference = ica_reference - np.mean(ica_reference)
+    co2_signal = co2_signal - np.mean(co2_signal)
 
-        ica_time_series = ica_time_series[:n_co2, :]
+    # ----------------------------------------
+    # Calculate cross-correlation
+    # ----------------------------------------
+
+    correlation = np.correlate(
+        ica_reference,
+        co2_signal,
+        mode="full"
+    )
+
+    # Find the lag with the strongest correlation
+    lag = np.argmax(correlation) - (n_co2 - 1)
+
+    print("Estimated lag:", lag)
+
+    # ----------------------------------------
+    # Shift signals according to the lag
+    # ----------------------------------------
+
+    if lag > 0:
+
+        ica_time_series = ica_time_series[lag:, :]
+
+    elif lag < 0:
+
+        co2_signal = co2_signal[-lag:]
+
+    # ----------------------------------------
+    # Match lengths after alignment
+    # ----------------------------------------
+
+    n = min(
+        ica_time_series.shape[0],
+        len(co2_signal)
+    )
+
+    ica_time_series = ica_time_series[:n, :]
+    co2_signal = co2_signal[:n]
+
+    print("Matched number of time points:", n)
 
     return ica_time_series, co2_signal
 
@@ -161,169 +204,214 @@ def main():
         "/Neurodata/M3PI/derivatives/Mayra_derivatives/vessels_melodic"
     )
 
-
-    # ------------------------------------
-    # Example subject
-    # ------------------------------------
-
-    subject = "sub-01"
+    co2_base_directory = Path(
+        "/Neurodata/M3PI/CO2"
+    )
 
     numbercomponents = 20
 
 
-    # MELODIC directory created by Bash
-    melodic_directory = (
-        base_directory
-        / subject
-        / f"{subject}{numbercomponents}_melodic"
+    # ------------------------------------
+    # Find all subjects
+    # ------------------------------------
+
+    subjects = sorted(
+        folder.name
+        for folder in base_directory.iterdir()
+        if folder.is_dir() and folder.name.startswith("sub-")
     )
 
-
-    # ------------------------------------
-    # CO2 file
-    # ------------------------------------
-
-    co2_file = Path(
-        f"/Neurodata/M3PI/CO2/{subject}.csv"
-    )
-
-
-    # ------------------------------------
-    # Check files exist
-    # ------------------------------------
-
-    if not melodic_directory.exists():
-
-        raise FileNotFoundError(
-            f"MELODIC directory not found:\n"
-            f"{melodic_directory}"
-        )
-
-
-    if not co2_file.exists():
-
-        raise FileNotFoundError(
-            f"CO2 file not found:\n"
-            f"{co2_file}"
-        )
-
-
-    # ------------------------------------
-    # Load ICA spatial maps
-    # ------------------------------------
-
-    spatial_maps = load_spatial_maps(
-        melodic_directory
-    )
-
-
-    # ------------------------------------
-    # Load ICA time series
-    # ------------------------------------
-
-    ica_time_series = load_time_series(
-        melodic_directory
-    )
-
-
-    # ------------------------------------
-    # Load CO2
-    # ------------------------------------
-
-    co2 = load_co2(
-        co2_file
-    )
-
-
-    # ------------------------------------
-    # Print basic information
-    # ------------------------------------
 
     print("\n====================================")
     print("ICA / CO2 ANALYSIS")
     print("====================================")
 
-    print("\nSubject:")
-    print(subject)
-
-    print("\nMELODIC directory:")
-    print(melodic_directory)
-
-    print("\nSpatial map shape:")
-    print(spatial_maps.shape)
-
-    print("\nICA time series shape:")
-    print(ica_time_series.shape)
-
-    print("\nCO2 data:")
-    print(co2.head())
+    print("\nSubjects found:")
+    print(subjects)
 
 
     # ------------------------------------
-    # Extract CO2 signal
+    # Loop through every subject
     # ------------------------------------
 
-    co2_signal = get_co2_signal(
-        co2
-    )
+    for subject in subjects:
+
+        print("\n\n====================================")
+        print(f"Processing {subject}")
+        print("====================================")
+
+
+        # ------------------------------------
+        # MELODIC directory
+        # ------------------------------------
+
+        melodic_directory = (
+            base_directory
+            / subject
+            / f"{subject}{numbercomponents}_melodic"
+        )
+
+
+        # ------------------------------------
+        # CO2 file
+        # ------------------------------------
+
+        co2_file = (
+            co2_base_directory
+            / f"{subject}.csv"
+        )
+
+
+        # ------------------------------------
+        # Check MELODIC directory
+        # ------------------------------------
+
+        if not melodic_directory.exists():
+
+            print(
+                f"\nWARNING: MELODIC directory not found for "
+                f"{subject}:"
+            )
+
+            print(melodic_directory)
+
+            print("Skipping subject.")
+
+            continue
+
+
+        # ------------------------------------
+        # Check CO2 file
+        # ------------------------------------
+
+        if not co2_file.exists():
+
+            print(
+                f"\nWARNING: CO2 file not found for "
+                f"{subject}:"
+            )
+
+            print(co2_file)
+
+            print("Skipping subject.")
+
+            continue
+
+
+        # ------------------------------------
+        # Load ICA spatial maps
+        # ------------------------------------
+
+        spatial_maps = load_spatial_maps(
+            melodic_directory
+        )
+
+
+        # ------------------------------------
+        # Load ICA time series
+        # ------------------------------------
+
+        ica_time_series = load_time_series(
+            melodic_directory
+        )
+
+
+        # ------------------------------------
+        # Load CO2
+        # ------------------------------------
+
+        co2 = load_co2(
+            co2_file
+        )
+
+
+        # ------------------------------------
+        # Print basic information
+        # ------------------------------------
+
+        print("\nSubject:")
+        print(subject)
+
+        print("\nMELODIC directory:")
+        print(melodic_directory)
+
+        print("\nSpatial map shape:")
+        print(spatial_maps.shape)
+
+        print("\nICA time series shape:")
+        print(ica_time_series.shape)
+
+        print("\nCO2 data:")
+        print(co2.head())
+
+
+        # ------------------------------------
+        # Extract CO2 signal
+        # ------------------------------------
+
+        co2_signal = get_co2_signal(
+            co2
+        )
+
+
+        # ------------------------------------
+        # Match ICA and CO2 lengths
+        # ------------------------------------
+
+        ica_time_series, co2_signal = match_lengths(
+            ica_time_series,
+            co2_signal
+        )
+
+
+        # ------------------------------------
+        # Calculate correlations
+        # ------------------------------------
+
+        correlations = correlate_components(
+            ica_time_series,
+            co2_signal
+        )
+
+
+        # ------------------------------------
+        # Save results
+        # ------------------------------------
+
+        output_file = (
+            melodic_directory
+            / "ICA_CO2_correlations.csv"
+        )
+
+
+        results = save_results(
+            correlations,
+            output_file
+        )
+
+
+        # ------------------------------------
+        # Display results
+        # ------------------------------------
+
+        print("\n====================================")
+        print(f"ICA COMPONENT / CO2 CORRELATIONS")
+        print(f"Subject: {subject}")
+        print("====================================")
+
+        print(
+            results.to_string(index=False)
+        )
+
+
+        print("\nResults saved to:")
+        print(output_file)
 
 
     # ------------------------------------
-    # Match lengths
+    # Finished
     # ------------------------------------
 
-    ica_time_series, co2_signal = match_lengths(
-        ica_time_series,
-        co2_signal
-    )
-
-
-    # ------------------------------------
-    # Calculate correlations
-    # ------------------------------------
-
-    correlations = correlate_components(
-        ica_time_series,
-        co2_signal
-    )
-
-
-    # ------------------------------------
-    # Save results
-    # ------------------------------------
-
-    output_file = (
-        melodic_directory
-        / "ICA_CO2_correlations.csv"
-    )
-
-
-    results = save_results(
-        correlations,
-        output_file
-    )
-
-
-    # ------------------------------------
-    # Display results
-    # ------------------------------------
-
-    print("\n====================================")
-    print("ICA COMPONENT / CO2 CORRELATIONS")
+    print("\n\n====================================")
+    print("ALL SUBJECTS COMPLETE")
     print("====================================")
-
-    print(results.to_string(index=False))
-
-
-    print("\nResults saved to:")
-    print(output_file)
-
-
-# ----------------------------------------
-# Run main
-# ----------------------------------------
-
-if __name__ == "__main__":
-
-    main()
-
