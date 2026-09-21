@@ -32,7 +32,7 @@ do
     echo "Processing ${subject}"
 
     # Create output directory for subject
-    subject_out="/Neurodata/M3PI/derivatives/Mayra_derivatives/vessels/vessels_melodic/${subject}"
+    subject_out="-B /Neurodata:/Neurodata/M3PI/derivatives/Mayra_derivatives/vessels/vessels_melodic/${subject}"
 
     mkdir -p "${subject_out}"
 
@@ -57,14 +57,14 @@ do
         # Define directories for the current subject/session
         # ------------------------------------------------
 
-        DATA_DIR="/Neurodata/M3PI/derivatives/vessels/${subject}/${session}/func"
+        DATA_DIR="-B /Neurodata:/Neurodata/M3PI/derivatives/vessels/${subject}/${session}/func"
 
 
         # Location of functional image
         func="${DATA_DIR}/00.${subject}_${session}_task-simon_optcom_native_preprocessed.nii.gz"
 
         # Location of brain mask
-        session_mask="/Neurodata/M3PI/derivatives/vessels/${subject}/${session}/reg/sbref_brain_mask.nii.gz"
+        session_mask="-B /Neurodata:/Neurodata/M3PI/derivatives/vessels/${subject}/${session}/reg/sbref_brain_mask.nii.gz"
 
 
         # --------------------------------------------
