@@ -32,7 +32,7 @@ do
     echo "Processing ${subject}"
 
     # Create output directory for subject
-    subject_out="/Neurodata/M3PI/derivatives/Mayra_derivatives/vessels/vessels_melodic/${subject}"
+    subject_out="subject_out="/data/Mayra_derivatives/vessels/vessels_melodic/${subject}""
 
     mkdir -p "${subject_out}"
 
@@ -57,14 +57,14 @@ do
         # Define directories for the current subject/session
         # ------------------------------------------------
 
-        DATA_DIR="/Neurodata/M3PI/derivatives/vessels/${subject}/${session}/func"
+        DATA_DIR="-B /Neurodata:/Neurodata/M3PI/derivatives/vessels/${subject}/${session}/func"
 
 
         # Location of functional image
         func="${DATA_DIR}/00.${subject}_${session}_task-simon_optcom_native_preprocessed.nii.gz"
 
         # Location of brain mask
-        session_mask="/Neurodata/M3PI/derivatives/vessels/${subject}/${session}/reg/sbref_brain_mask.nii.gz"
+        session_mask="-B /Neurodata:/Neurodata/M3PI/derivatives/vessels/${subject}/${session}/reg/sbref_brain_mask.nii.gz"
 
 
         # --------------------------------------------
@@ -123,9 +123,40 @@ do
 
     fi
 
-
     # ------------------------------------------------
-    # 7. Concatenate sessions
+    # 7. Calculate signal percentage change
+    #    BEFORE concatenation
+    # ------------------------------------------------
+
+    echo "Calculating signal percentage change for ${subject} ${session}..."
+
+    # Mean functional image
+    mean="${subject_out}/${subject}_${session}_mean.nii.gz"
+
+    # Signal percentage change image
+    spc="${subject_out}/${subject}_${session}_spc.nii.gz"
+
+    # Calculate temporal mean
+    fslmaths "$func" \
+        -Tmean "$mean"
+
+    # Calculate:
+    # (func - mean) / mean
+    fslmaths "$func" \
+        -sub "$mean" \
+        -div "$mean" \
+        "$spc"
+
+    echo "Created SPC:"
+    echo "$spc"
+    # ------------------------------------------------
+     # Add SPC image to functional list
+     # ------------------------------------------------
+
+        func_list+=("$spc")
+    done
+    # ------------------------------------------------
+    # 8. Concatenate sessions
     # ------------------------------------------------
 
     concatenated="${subject_out}/concatenated_func.nii.gz"
@@ -152,7 +183,7 @@ do
     melodic_output="${subject_out}/${subject}${numbercomponents}_melodic"
 
     # ------------------------------------------------
-    # 8. Run MELODIC
+    # 9. Run MELODIC
     # ------------------------------------------------
 
     echo "Running MELODIC..."
