@@ -1,0 +1,1409 @@
+#!/usr/bin/env python3
+
+from pathlib import Path
+import subprocess
+
+import nibabel as nib
+import numpy as np
+import pandas as pd
+import scipy.interpolate as spint
+from scipy.signal import find_peaks
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+# ------------------------------------------------------------
+# Sampling frequencies
+# ------------------------------------------------------------
+#
+# IMPORTANT:
+# Replace these with the actual frequencies from your data.
+#
+# CO2_FREQ = sampling frequency of the original CO2 recording
+# ICA_FREQ = sampling frequency of the MELODIC time series
+#
+# For fMRI, ICA_FREQ is usually:
+#
+#     ICA_FREQ = 1 / TR
+#
+# ------------------------------------------------------------
+
+CO2_FREQ = 10.0
+
+# CHANGE THIS TO 1 / YOUR_TR
+ICA_FREQ = 1.0
+
+# Frequency used for both signals before cross-correlation
+TARGET_FREQ = ICA_FREQ
+
+
+# ------------------------------------------------------------
+# Number of ICA components
+# ------------------------------------------------------------
+
+NUMBER_COMPONENTS = 20
+
+
+# ------------------------------------------------------------
+# Functional network maps
+# ------------------------------------------------------------
+
+NETWORKS = [
+    "ecn",
+    "dna",
+    "dnb"
+]
+
+
+# ============================================================
+# LOAD ICA SPATIAL MAPS
+# ============================================================
+
+def load_spatial_maps(melodic_directory):
+
+    maps = nib.load(
+        Path(melodic_directory) / "melodic_IC.nii.gz"
+    )
+
+    return maps
+
+
+# ============================================================
+# LOAD ICA TIME SERIES
+# ============================================================
+
+def load_time_series(melodic_directory):
+
+    return np.loadtxt(
+        Path(melodic_directory) / "melodic_mix"
+    )
+
+
+# ============================================================
+# LOAD CO2 RECORDING
+# ============================================================
+
+def load_co2(file):
+
+    return pd.read_csv(file)
+
+
+# ============================================================
+# PREPARE CO2 SIGNAL
+# ============================================================
+
+def get_co2_signal(co2):
+
+    print("\nCO2 columns:")
+    print(co2.columns)
+
+    numerical_columns = co2.select_dtypes(
+        include=np.number
+    ).columns
+
+    if len(numerical_columns) == 0:
+
+        raise ValueError(
+            "No numerical CO2 column was found."
+        )
+
+    print(
+        "\nUsing CO2 column:"
+    )
+
+    print(
+        numerical_columns[0]
+    )
+
+    co2_signal = (
+        co2[numerical_columns[0]]
+        .to_numpy()
+    )
+
+    return co2_signal
+
+
+# ============================================================
+# RESAMPLE SIGNAL
+# ============================================================
+
+def resample_signal_freqs(
+    ts,
+    freq1,
+    freq2,
+    axis=-1
+):
+    """
+    Resample a timeseries from freq1 to freq2.
+    """
+
+    ts = np.asarray(ts)
+
+    len_tp = ts.shape[axis]
+
+    len_s = (
+        (len_tp - 1)
+        / freq1
+    )
+
+    regr_t = np.linspace(
+        0,
+        len_s,
+        int(len_s * freq2) + 1
+    )
+
+    time_t = np.linspace(
+        0,
+        len_s,
+        len_tp
+    )
+
+    f = spint.interp1d(
+        time_t,
+        ts,
+        fill_value="extrapolate",
+        axis=axis
+    )
+
+    return f(regr_t)
+
+
+# ============================================================
+# DETECT CO2 PEAKS
+# ============================================================
+
+def detect_co2_peaks(
+    co2_signal,
+    freq
+):
+    """
+    Detect peaks in the CO2 signal.
+
+    The minimum distance is set to approximately
+    1 second between peaks.
+    """
+
+    minimum_distance = max(
+        1,
+        int(freq)
+    )
+
+    peaks, _ = find_peaks(
+        co2_signal,
+        distance=minimum_distance
+    )
+
+    print(
+        "\nNumber of CO2 peaks detected:",
+        len(peaks)
+    )
+
+    return peaks
+
+
+# ============================================================
+# END-TIDAL INTERPOLATION
+# ============================================================
+
+def endtidal_interpolation(
+    co2,
+    pidx,
+    axis=-1
+):
+    """
+    Interpolate the CO2 signal using values at detected peaks
+    to create the PetCO2 signal.
+    """
+
+    co2 = np.asarray(
+        co2
+    ).squeeze()
+
+    pidx = np.asarray(
+        pidx
+    )
+
+    if len(pidx) < 2:
+
+        raise ValueError(
+            "At least two CO2 peaks are required "
+            "for end-tidal interpolation."
+        )
+
+    time = np.arange(
+        co2.shape[axis]
+    )
+
+    peak_times = time[pidx]
+
+    peak_values = co2[pidx]
+
+    interpolator = spint.interp1d(
+        peak_times,
+        peak_values,
+        bounds_error=False,
+        fill_value="extrapolate"
+    )
+
+    return interpolator(
+        time
+    )
+
+
+# ============================================================
+# CREATE HRF
+# ============================================================
+
+def create_hrf(freq):
+    """
+    Create a canonical HRF sampled at the specified frequency.
+    """
+
+    duration = 32.0
+
+    time = np.arange(
+        0,
+        duration,
+        1.0 / freq
+    )
+
+    # Canonical double-gamma style HRF
+    hrf = (
+        (time ** 5)
+        * np.exp(-time)
+        -
+        0.35
+        * (time ** 12)
+        * np.exp(-time)
+    )
+
+    max_value = np.max(
+        np.abs(hrf)
+    )
+
+    if max_value != 0:
+
+        hrf = (
+            hrf
+            / max_value
+        )
+
+    return hrf
+
+
+# ============================================================
+# CONVOLVE SIGNAL
+# ============================================================
+
+def convolve_signal(
+    signal,
+    freq,
+    response_function="hrf",
+    mode="full"
+):
+    """
+    Convolve a signal with an HRF.
+    """
+
+    signal = np.asarray(
+        signal
+    ).squeeze()
+
+    if response_function in [
+        None,
+        "none",
+        "None",
+        "NONE"
+    ]:
+
+        return signal
+
+    if response_function.lower() == "hrf":
+
+        hrf = create_hrf(
+            freq
+        )
+
+        return np.convolve(
+            signal,
+            hrf,
+            mode=mode
+        )
+
+    raise ValueError(
+        f"Unknown response function: "
+        f"{response_function}"
+    )
+
+
+# ============================================================
+# COMPUTE PETCO2 HRF
+# ============================================================
+
+def compute_petco2hrf(
+    co2,
+    pidx,
+    freq,
+    outprefix,
+    comp_endtidal=True,
+    response_function="hrf",
+    mode="full"
+):
+    """
+    Create the PetCO2 trace and convolve it with an HRF.
+    """
+
+    co2 = co2.squeeze()
+
+    if co2.ndim > 1:
+
+        raise NotImplementedError(
+            "Arrays with more than 2 dimensions "
+            "are not supported."
+        )
+
+    # --------------------------------------------------------
+    # End-tidal interpolation
+    # --------------------------------------------------------
+
+    if (
+        comp_endtidal
+        and pidx is not None
+    ):
+
+        petco2 = endtidal_interpolation(
+            co2,
+            pidx,
+            axis=-1
+        )
+
+        # Demean PetCO2
+        petco2 = (
+            petco2
+            - petco2.mean()
+        )
+
+        # Save PetCO2
+        np.savetxt(
+            f"{outprefix}_petco2.1D",
+            petco2,
+            fmt="%.18f"
+        )
+
+    elif (
+        comp_endtidal
+        and pidx is None
+    ):
+
+        raise ValueError(
+            "End-tidal interpolation was requested, "
+            "but peaks were not provided."
+        )
+
+    else:
+
+        petco2 = (
+            co2
+            - co2.mean()
+        )
+
+    # --------------------------------------------------------
+    # HRF convolution
+    # --------------------------------------------------------
+
+    if response_function not in [
+        None,
+        "none",
+        "None",
+        "NONE"
+    ]:
+
+        petco2hrf = convolve_signal(
+            petco2,
+            freq,
+            response_function,
+            mode
+        )
+
+    else:
+
+        petco2hrf = petco2
+
+    # --------------------------------------------------------
+    # Save PetCO2-HRF
+    # --------------------------------------------------------
+
+    np.savetxt(
+        f"{outprefix}_petco2hrf.1D",
+        petco2hrf,
+        fmt="%.18f"
+    )
+
+    return petco2hrf
+
+
+# ============================================================
+# TRIM SIGNALS TO SAME LENGTH
+# ============================================================
+
+def trim_signals(
+    ica_signal,
+    co2_signal
+):
+    """
+    Trim two signals to the same number of time points.
+    """
+
+    n = min(
+        len(ica_signal),
+        len(co2_signal)
+    )
+
+    return (
+        ica_signal[:n],
+        co2_signal[:n]
+    )
+
+
+# ============================================================
+# CROSS-CORRELATION
+# ============================================================
+
+def compute_cross_correlation(
+    ica_signal,
+    co2_signal,
+    freq
+):
+    """
+    Calculate full cross-correlation and estimate the
+    temporal lag.
+    """
+
+    ica_signal = np.asarray(
+        ica_signal
+    ).squeeze()
+
+    co2_signal = np.asarray(
+        co2_signal
+    ).squeeze()
+
+    # --------------------------------------------------------
+    # Match lengths
+    # --------------------------------------------------------
+
+    ica_signal, co2_signal = trim_signals(
+        ica_signal,
+        co2_signal
+    )
+
+    n = len(
+        ica_signal
+    )
+
+    # --------------------------------------------------------
+    # Remove means
+    # --------------------------------------------------------
+
+    ica_signal = (
+        ica_signal
+        - np.mean(ica_signal)
+    )
+
+    co2_signal = (
+        co2_signal
+        - np.mean(co2_signal)
+    )
+
+    # --------------------------------------------------------
+    # Normalize signals
+    #
+    # This makes the result easier to interpret as a
+    # normalized cross-correlation.
+    # --------------------------------------------------------
+
+    ica_std = np.std(
+        ica_signal
+    )
+
+    co2_std = np.std(
+        co2_signal
+    )
+
+    if (
+        ica_std == 0
+        or co2_std == 0
+    ):
+
+        raise ValueError(
+            "One of the signals has zero variance."
+        )
+
+    ica_signal = (
+        ica_signal
+        / ica_std
+    )
+
+    co2_signal = (
+        co2_signal
+        / co2_std
+    )
+
+    # --------------------------------------------------------
+    # Cross-correlation
+    # --------------------------------------------------------
+
+    correlation = np.correlate(
+        ica_signal,
+        co2_signal,
+        mode="full"
+    )
+
+    # Normalize by number of samples
+    correlation = (
+        correlation
+        / n
+    )
+
+    # --------------------------------------------------------
+    # Calculate lag values
+    # --------------------------------------------------------
+
+    lags = np.arange(
+        -(n - 1),
+        n
+    )
+
+    # --------------------------------------------------------
+    # Find maximum absolute correlation
+    # --------------------------------------------------------
+
+    maximum_index = np.argmax(
+        np.abs(correlation)
+    )
+
+    maximum_correlation = (
+        correlation[maximum_index]
+    )
+
+    lag_samples = (
+        lags[maximum_index]
+    )
+
+    lag_seconds = (
+        lag_samples
+        / freq
+    )
+
+    return (
+        maximum_correlation,
+        lag_samples,
+        lag_seconds,
+        correlation,
+        lags
+    )
+
+
+# ============================================================
+# CORRELATE EVERY ICA COMPONENT
+# ============================================================
+
+def correlate_components(
+    ica_time_series,
+    co2_signal,
+    freq
+):
+    """
+    Calculate cross-correlation between every ICA component
+    and the PetCO2-HRF signal.
+    """
+
+    results = []
+
+    number_components = (
+        ica_time_series.shape[1]
+    )
+
+    for component in range(
+        number_components
+    ):
+
+        print(
+            f"  Processing ICA component "
+            f"{component + 1}"
+        )
+
+        component_signal = (
+            ica_time_series[:, component]
+        )
+
+        (
+            maximum_correlation,
+            lag_samples,
+            lag_seconds,
+            correlation,
+            lags
+        ) = compute_cross_correlation(
+            component_signal,
+            co2_signal,
+            freq
+        )
+
+        results.append(
+            {
+                "component":
+                    component + 1,
+
+                "max_cross_correlation":
+                    maximum_correlation,
+
+                "absolute_cross_correlation":
+                    abs(
+                        maximum_correlation
+                    ),
+
+                "lag_samples":
+                    lag_samples,
+
+                "lag_seconds":
+                    lag_seconds
+            }
+        )
+
+    return pd.DataFrame(
+        results
+    )
+
+
+# ============================================================
+# SAVE CORRELATION RESULTS
+# ============================================================
+
+def save_results(
+    results,
+    output_file
+):
+
+    results = results.sort_values(
+        "absolute_cross_correlation",
+        ascending=False
+    )
+
+    results.to_csv(
+        output_file,
+        index=False
+    )
+
+    return results
+
+
+# ============================================================
+# TRANSFORM FUNCTIONAL NETWORK MAPS
+# ============================================================
+
+def transform_network_maps(
+    subject
+):
+    """
+    Transform ECN, DAN and DN-B functional network masks
+    into vessel-reference space using ANTs.
+    """
+
+    print(
+        "\n----------------------------------------"
+    )
+
+    print(
+        f"ANTs registration for {subject}"
+    )
+
+    print(
+        "----------------------------------------"
+    )
+
+    # --------------------------------------------------------
+    # Subject number
+    # --------------------------------------------------------
+
+    subject_number = subject.replace(
+        "sub-",
+        ""
+    )
+
+    # --------------------------------------------------------
+    # Vessel reference
+    # --------------------------------------------------------
+
+    anat_reference = Path(
+        f"/Neurodata/vessels/"
+        f"sub-{subject_number}/"
+        f"ses-7T/reg/"
+        f"sub-{subject_number}_vesselref.nii.gz"
+    )
+
+    # --------------------------------------------------------
+    # Transforms
+    # --------------------------------------------------------
+
+    T1w2T2starw = Path(
+        f"/Neurodata/vessels/"
+        f"sub-{subject_number}/"
+        f"ses-7T/reg/"
+        f"sub-{subject_number}_ses-02_"
+        f"UNIT12vesselref0GenericAffine.mat"
+    )
+
+    T2w2T1w = Path(
+        f"/Neurodata/vessels/"
+        f"sub-{subject_number}/"
+        f"ses-02/reg/"
+        f"sub-{subject_number}_ses-02_"
+        f"T2w2UNIT10GenericAffine.mat"
+    )
+
+    T2w2func = Path(
+        f"/Neurodata/vessels/"
+        f"sub-{subject_number}/"
+        f"ses-01/reg/"
+        f"sub-{subject_number}_ses-02_"
+        f"T2w2sbref0GenericAffine.mat"
+    )
+
+    # --------------------------------------------------------
+    # Input/output directory
+    # --------------------------------------------------------
+
+    func_net_directory = Path(
+        "/Neurodata/func_net_comp"
+    )
+
+    # --------------------------------------------------------
+    # Check transforms
+    # --------------------------------------------------------
+
+    required_files = [
+        anat_reference,
+        T1w2T2starw,
+        T2w2T1w,
+        T2w2func
+    ]
+
+    for file in required_files:
+
+        if not file.exists():
+
+            print(
+                "\nWARNING: Required ANTs file "
+                "not found:"
+            )
+
+            print(file)
+
+            print(
+                "Skipping ANTs transformation "
+                f"for {subject}."
+            )
+
+            return
+
+    # --------------------------------------------------------
+    # Transform ECN / DNA / DNB
+    # --------------------------------------------------------
+
+    for network in NETWORKS:
+
+        input_map = (
+            func_net_directory
+            / f"map_{network}_mask_"
+            f"{subject}.nii.gz"
+        )
+
+        output_map = (
+            func_net_directory
+            / f"map_{network}_mask_"
+            f"{subject}_vesselres.nii.gz"
+        )
+
+        print(
+            f"\nNetwork: {network}"
+        )
+
+        print(
+            "Input:",
+            input_map
+        )
+
+        print(
+            "Output:",
+            output_map
+        )
+
+        # ----------------------------------------------------
+        # Check input
+        # ----------------------------------------------------
+
+        if not input_map.exists():
+
+            print(
+                "WARNING: Input map not found."
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # ANTs command
+        # ----------------------------------------------------
+
+        command = [
+            "antsApplyTransforms",
+
+            "-d",
+            "3",
+
+            "-i",
+            str(input_map),
+
+            "-r",
+            str(anat_reference),
+
+            "-o",
+            str(output_map),
+
+            "-n",
+            "NearestNeighbor",
+
+            "-t",
+            str(T1w2T2starw),
+
+            "-t",
+            str(T2w2T1w),
+
+            "-t",
+            f"[{T2w2func},1]"
+        ]
+
+        # ----------------------------------------------------
+        # Run ANTs
+        # ----------------------------------------------------
+
+        print(
+            "\nRunning:"
+        )
+
+        print(
+            " ".join(command)
+        )
+
+        try:
+
+            subprocess.run(
+                command,
+                check=True
+            )
+
+        except subprocess.CalledProcessError as error:
+
+            print(
+                "\nERROR: ANTs transformation failed."
+            )
+
+            print(error)
+
+            continue
+
+        # ----------------------------------------------------
+        # Check output
+        # ----------------------------------------------------
+
+        if output_map.exists():
+
+            print(
+                "\nSuccessfully created:"
+            )
+
+            print(
+                output_map
+            )
+
+        else:
+
+            print(
+                "\nERROR: ANTs completed but "
+                "output was not found:"
+            )
+
+            print(
+                output_map
+            )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    # ========================================================
+    # DIRECTORIES
+    # ========================================================
+
+    base_directory = Path(
+        "/Neurodata/M3PI/derivatives/"
+        "Mayra_derivatives/vessels_melodic"
+    )
+
+    co2_base_directory = Path(
+        "/Neurodata/M3PI/CO2"
+    )
+
+
+    # ========================================================
+    # FIND SUBJECTS
+    # ========================================================
+
+    subjects = sorted(
+        folder.name
+        for folder in base_directory.iterdir()
+        if (
+            folder.is_dir()
+            and folder.name.startswith("sub-")
+        )
+    )
+
+
+    print(
+        "\n===================================="
+    )
+
+    print(
+        "ICA / CO2 / VESSEL ANALYSIS"
+    )
+
+    print(
+        "===================================="
+    )
+
+    print(
+        "\nSubjects found:"
+    )
+
+    print(
+        subjects
+    )
+
+
+    # ========================================================
+    # SUBJECT LOOP
+    # ========================================================
+
+    for subject in subjects:
+
+        print(
+            "\n\n===================================="
+        )
+
+        print(
+            f"Processing {subject}"
+        )
+
+        print(
+            "===================================="
+        )
+
+
+        # ====================================================
+        # 1. ANTS SPATIAL REGISTRATION
+        # ====================================================
+
+        transform_network_maps(
+            subject
+        )
+
+
+        # ====================================================
+        # 2. MELODIC DIRECTORY
+        # ====================================================
+
+        melodic_directory = (
+            base_directory
+            / subject
+            / f"{subject}"
+            f"{NUMBER_COMPONENTS}"
+            "_melodic"
+        )
+
+
+        # ====================================================
+        # 3. CO2 FILE
+        # ====================================================
+
+        co2_file = (
+            co2_base_directory
+            / f"{subject}.csv"
+        )
+
+
+        # ====================================================
+        # 4. CHECK MELODIC DIRECTORY
+        # ====================================================
+
+        if not melodic_directory.exists():
+
+            print(
+                "\nWARNING: MELODIC directory "
+                f"not found for {subject}:"
+            )
+
+            print(
+                melodic_directory
+            )
+
+            print(
+                "Skipping subject."
+            )
+
+            continue
+
+
+        # ====================================================
+        # 5. CHECK CO2 FILE
+        # ====================================================
+
+        if not co2_file.exists():
+
+            print(
+                "\nWARNING: CO2 file "
+                f"not found for {subject}:"
+            )
+
+            print(
+                co2_file
+            )
+
+            print(
+                "Skipping subject."
+            )
+
+            continue
+
+
+        # ====================================================
+        # 6. LOAD ICA SPATIAL MAPS
+        # ====================================================
+
+        spatial_maps = load_spatial_maps(
+            melodic_directory
+        )
+
+
+        # ====================================================
+        # 7. LOAD ICA TIME SERIES
+        # ====================================================
+
+        ica_time_series = load_time_series(
+            melodic_directory
+        )
+
+
+        # ====================================================
+        # 8. LOAD CO2
+        # ====================================================
+
+        co2 = load_co2(
+            co2_file
+        )
+
+
+        # ====================================================
+        # 9. PRINT BASIC INFORMATION
+        # ====================================================
+
+        print(
+            "\nSubject:"
+        )
+
+        print(
+            subject
+        )
+
+        print(
+            "\nMELODIC directory:"
+        )
+
+        print(
+            melodic_directory
+        )
+
+        print(
+            "\nSpatial map shape:"
+        )
+
+        print(
+            spatial_maps.shape
+        )
+
+        print(
+            "\nICA time series shape:"
+        )
+
+        print(
+            ica_time_series.shape
+        )
+
+        print(
+            "\nCO2 data:"
+        )
+
+        print(
+            co2.head()
+        )
+
+
+        # ====================================================
+        # 10. EXTRACT CO2 SIGNAL
+        # ====================================================
+
+        co2_signal = get_co2_signal(
+            co2
+        )
+
+
+        print(
+            "\nOriginal CO2 time points:"
+        )
+
+        print(
+            len(co2_signal)
+        )
+
+
+        # ====================================================
+        # 11. RESAMPLE CO2
+        # ====================================================
+
+        print(
+            "\nResampling CO2..."
+        )
+
+        print(
+            f"Original frequency: "
+            f"{CO2_FREQ} Hz"
+        )
+
+        print(
+            f"Target frequency: "
+            f"{TARGET_FREQ} Hz"
+        )
+
+        co2_resampled = (
+            resample_signal_freqs(
+                co2_signal,
+                CO2_FREQ,
+                TARGET_FREQ
+            )
+        )
+
+
+        print(
+            "Resampled CO2 time points:"
+        )
+
+        print(
+            len(co2_resampled)
+        )
+
+
+        # ====================================================
+        # 12. DETECT CO2 PEAKS
+        # ====================================================
+
+        peaks = detect_co2_peaks(
+            co2_resampled,
+            TARGET_FREQ
+        )
+
+
+        # ====================================================
+        # 13. CREATE PETCO2-HRF
+        # ====================================================
+
+        subject_output = (
+            melodic_directory
+        )
+
+        outprefix = (
+            subject_output
+            / f"{subject}_CO2"
+        )
+
+
+        print(
+            "\nCreating PetCO2-HRF..."
+        )
+
+
+        petco2hrf = compute_petco2hrf(
+            co2_resampled,
+            peaks,
+            TARGET_FREQ,
+            str(outprefix),
+            comp_endtidal=True,
+            response_function="hrf",
+            mode="full"
+        )
+
+
+        print(
+            "PetCO2-HRF time points:"
+        )
+
+        print(
+            len(petco2hrf)
+        )
+
+
+        # ====================================================
+        # 14. RESAMPLE ICA TIME SERIES
+        # ====================================================
+
+        print(
+            "\nICA time series frequency:"
+        )
+
+        print(
+            f"{ICA_FREQ} Hz"
+        )
+
+
+        if ICA_FREQ != TARGET_FREQ:
+
+            print(
+                "Resampling ICA time series..."
+            )
+
+            ica_time_series = (
+                resample_signal_freqs(
+                    ica_time_series,
+                    ICA_FREQ,
+                    TARGET_FREQ,
+                    axis=0
+                )
+            )
+
+
+        print(
+            "\nFinal ICA time series shape:"
+        )
+
+        print(
+            ica_time_series.shape
+        )
+
+
+        # ====================================================
+        # 15. CROSS-CORRELATE EVERY ICA COMPONENT
+        # ====================================================
+
+        print(
+            "\nCalculating ICA / PetCO2-HRF "
+            "cross-correlations..."
+        )
+
+
+        results = correlate_components(
+            ica_time_series,
+            petco2hrf,
+            TARGET_FREQ
+        )
+
+
+        # ====================================================
+        # 16. ADD SUBJECT INFORMATION
+        # ====================================================
+
+        results.insert(
+            0,
+            "subject",
+            subject
+        )
+
+
+        # ====================================================
+        # 17. SAVE RESULTS
+        # ====================================================
+
+        output_file = (
+            melodic_directory
+            / "ICA_PetCO2_HRF_crosscorrelations.csv"
+        )
+
+
+        results = save_results(
+            results,
+            output_file
+        )
+
+
+        # ====================================================
+        # 18. DISPLAY RESULTS
+        # ====================================================
+
+        print(
+            "\n===================================="
+        )
+
+        print(
+            "ICA COMPONENT / PETCO2-HRF "
+            "CROSS-CORRELATIONS"
+        )
+
+        print(
+            f"Subject: {subject}"
+        )
+
+        print(
+            "===================================="
+        )
+
+
+        print(
+            results.to_string(
+                index=False
+            )
+        )
+
+
+        print(
+            "\nResults saved to:"
+        )
+
+        print(
+            output_file
+        )
+
+
+    # ========================================================
+    # FINISHED
+    # ========================================================
+
+    print(
+        "\n\n===================================="
+    )
+
+    print(
+        "ALL SUBJECTS COMPLETE"
+    )
+
+    print(
+        "===================================="
+    )
+
+
+# ============================================================
+# RUN PROGRAM
+# ============================================================
+
+if __name__ == "__main__":
+
+    main()
