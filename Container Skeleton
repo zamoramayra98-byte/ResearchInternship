@@ -1,0 +1,28 @@
+FROM ubuntu:20.04
+
+ENV FSLDIR=/usr/local/fsl
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=en_GB.UTF-8
+
+RUN apt-get update -y && \
+    apt-get upgrade -y && \
+    apt-get install -y \
+        python3 \
+        wget \
+        file \
+        dc \
+        mesa-utils \
+        pulseaudio \
+        libquadmath0 \
+        libgtk2.0-0 \
+        firefox \
+        libgomp1 \
+        && rm -rf /var/lib/apt/lists/*
+
+RUN wget https://fsl.fmrib.ox.ac.uk/fsldownloads/fslconda/releases/fslinstaller.py
+
+RUN python3 ./fslinstaller.py -d /usr/local/fsl
+
+RUN rm ./fslinstaller.py
+
+ENTRYPOINT ["/bin/bash", "-c", ". /usr/local/fsl/etc/fslconf/fsl.sh && exec /bin/bash"]

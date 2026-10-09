@@ -1,0 +1,12 @@
+Simplifying Code Into English Text:
+Step 1: Start with the data (integrate the data into Bash)
+Step 2: Preprocessing (Filter/double-check the data) 
+Step 3: Run MELODIC
+Step 4: Load data from MELODIC into Python  
+Step 5: Load the ICA time series
+Step 6: Now use the ICA data to compare against CO_2 data (repeat for every ICA component)
+Step 7: Calculate the lag (possible delay due to CO_2)
+Step 8: Spatial Overlap? (used to test whether or not the data has a strong overlap)
+Step 9: Classify Components 
+Break down the data and explain what can be inferred from it
+Step 10: Statistical testing (Neuronal vs. Vascular - t-test/ANOVA)
