@@ -1,0 +1,817 @@
+#!/usr/bin/env python3
+
+from pathlib import Path
+import shutil
+import subprocess
+
+import nibabel as nib
+import numpy as np
+import pandas as pd
+import scipy.interpolate as spint
+from scipy.signal import find_peaks
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+
+CO2_FREQ = 10.0
+
+# fMRI TR = 1.5 seconds
+ICA_FREQ = 1 / 1.5
+
+# Keep CO2 at its original sampling frequency.
+TARGET_FREQ = CO2_FREQ
+
+
+# ============================================================
+# 2. DIRECTORIES
+# ============================================================
+
+
+BASE_DIRECTORY = Path(
+    "/data/M3PI/derivatives/Mayra_derivatives/vessels_melodic"
+)
+
+CO2_DIRECTORY = Path(
+    "/data/M3PI/CO2"
+)
+
+VESSEL_DIRECTORY = Path(
+    "/data/vessels"
+)
+
+NETWORK_DIRECTORY = Path(
+    "/data/func_net_comp"
+)
+
+NUMBER_COMPONENTS = 20
+
+
+# ============================================================
+# 3. LOAD ICA SPATIAL MAPS
+# ============================================================
+
+def load_spatial_maps(melodic_directory):
+
+    return nib.load(
+        Path(melodic_directory) / "melodic_IC.nii.gz"
+    )
+
+
+# ============================================================
+# LOAD ICA TIME SERIES
+# ============================================================
+
+def load_time_series(melodic_directory):
+
+    time_series = np.loadtxt(
+        Path(melodic_directory) / "melodic_mix"
+    )
+
+    # Ensure shape is (time points, components).
+    if time_series.ndim == 1:
+        time_series = time_series[:, np.newaxis]
+
+    return time_series
+
+
+# ============================================================
+# LOAD CO2 RECORDING
+# ============================================================
+
+def load_co2(file):
+
+    return pd.read_csv(file)
+
+
+# ============================================================
+# 6. EXTRACT CO2 SIGNAL
+# ============================================================
+
+def get_co2_signal(co2):
+
+    numerical_columns = co2.select_dtypes(
+        include=np.number
+    ).columns
+
+    if len(numerical_columns) == 0:
+        raise ValueError(
+            "No numerical CO2 column was found."
+        )
+
+    print("\nAvailable numerical CO2 columns:")
+    print(list(numerical_columns))
+
+    # Uses the first numerical column, as in your original code.
+    co2_signal = co2[numerical_columns[0]].to_numpy(
+        dtype=float
+    )
+
+    # Remove missing or infinite values only if you have
+    # verified that dropping them does not disrupt timing.
+    if not np.all(np.isfinite(co2_signal)):
+        raise ValueError(
+            "CO2 contains missing or non-finite values. "
+            "Clean the signal without disrupting its timing."
+        )
+
+    print("Using CO2 column:", numerical_columns[0])
+
+    return co2_signal
+
+
+# ============================================================
+# RESAMPLE SIGNAL
+# ============================================================
+
+def resample_signal_freqs(
+    ts,
+    freq1,
+    freq2,
+    axis=-1
+):
+    """
+    Resample a signal from freq1 to freq2.
+    """
+
+    ts = np.asarray(ts)
+
+    if freq1 <= 0 or freq2 <= 0:
+        raise ValueError(
+            "Sampling frequencies must be positive."
+        )
+
+    len_tp = ts.shape[axis]
+
+    if len_tp < 2:
+        raise ValueError(
+            "At least two samples are needed for resampling."
+        )
+
+    len_s = (len_tp - 1) / freq1
+
+    regr_t = np.linspace(
+        0,
+        len_s,
+        int(round(len_s * freq2)) + 1
+    )
+
+    time_t = np.arange(len_tp) / freq1
+
+    interpolator = spint.interp1d(
+        time_t,
+        ts,
+        axis=axis,
+        bounds_error=True
+    )
+
+    return interpolator(regr_t)
+
+
+# ============================================================
+# DETECT CO2 PEAKS
+# ============================================================
+
+def detect_co2_peaks(co2_signal, freq):
+
+    # Initial peak-detection setting:
+    # at least approximately one second between peaks.
+    minimum_distance = max(
+        1,
+        int(round(freq))
+    )
+
+    peaks, _ = find_peaks(
+        co2_signal,
+        distance=minimum_distance
+    )
+
+    print("CO2 peaks detected:", len(peaks))
+
+    if len(peaks) < 2:
+        raise ValueError(
+            "Fewer than two CO2 peaks detected. "
+            "Check the signal and peak-detection settings."
+        )
+
+    return peaks
+
+
+# ============================================================
+# END-TIDAL INTERPOLATION
+# ============================================================
+
+def endtidal_interpolation(co2, pidx):
+
+    co2 = np.asarray(co2).squeeze()
+    pidx = np.asarray(pidx, dtype=int)
+
+    if co2.ndim != 1:
+        raise ValueError(
+            "CO2 must be a one-dimensional signal."
+        )
+
+    if len(pidx) < 2:
+        raise ValueError(
+            "At least two peaks are needed for "
+            "end-tidal interpolation."
+        )
+
+    peak_times = pidx
+    peak_values = co2[pidx]
+
+    interpolator = spint.interp1d(
+        peak_times,
+        peak_values,
+        bounds_error=False,
+        fill_value="extrapolate"
+    )
+
+    time = np.arange(len(co2))
+
+    return interpolator(time)
+
+
+# ============================================================
+# CREATE HRF
+# ============================================================
+
+def create_hrf(freq):
+
+    duration = 32.0
+
+    time = np.arange(
+        0,
+        duration,
+        1.0 / freq
+    )
+
+    hrf = (
+        (time ** 5) * np.exp(-time)
+        - 0.35 * (time ** 12) * np.exp(-time)
+    )
+
+    maximum = np.max(np.abs(hrf))
+
+    if maximum > 0:
+        hrf = hrf / maximum
+
+    return hrf
+
+
+# ============================================================
+# CONVOLVE SIGNAL
+# ============================================================
+
+def convolve_signal(
+    signal,
+    freq,
+    response_function="hrf",
+    mode="full"
+):
+
+    signal = np.asarray(signal).squeeze()
+
+    if response_function in (
+        None, "none", "None", "NONE"
+    ):
+        return signal
+
+    if response_function.lower() == "hrf":
+
+        hrf = create_hrf(freq)
+
+        return np.convolve(
+            signal,
+            hrf,
+            mode=mode
+        )
+
+    raise ValueError(
+        f"Unsupported response function: {response_function}"
+    )
+
+
+# ============================================================
+# COMPUTE PETCO2 HRF
+# ============================================================
+
+def compute_petco2hrf(
+    co2,
+    pidx,
+    freq,
+    outprefix,
+    comp_endtidal=True,
+    response_function="hrf",
+    mode="full"
+):
+
+    co2 = np.asarray(co2).squeeze()
+
+    if co2.ndim != 1:
+        raise ValueError(
+            "CO2 must be a one-dimensional signal."
+        )
+
+    if comp_endtidal:
+
+        if pidx is None:
+            raise ValueError(
+                "End-tidal interpolation requires peak indices."
+            )
+
+        petco2 = endtidal_interpolation(
+            co2,
+            pidx
+        )
+
+    else:
+        petco2 = co2.copy()
+
+    # Demean the PetCO2 signal.
+    petco2 = petco2 - np.mean(petco2)
+
+    np.savetxt(
+        f"{outprefix}_petco2.1D",
+        petco2,
+        fmt="%.18f"
+    )
+
+    # Convolve PetCO2 with the HRF.
+    petco2hrf = convolve_signal(
+        petco2,
+        freq,
+        response_function,
+        mode
+    )
+
+    np.savetxt(
+        f"{outprefix}_petco2hrf.1D",
+        petco2hrf,
+        fmt="%.18f"
+    )
+
+    return petco2hrf
+
+
+# ============================================================
+# 13. POSITIVE-LAG ALIGNMENT
+# ============================================================
+
+def align_by_positive_lag(
+    ica_signal,
+    co2_signal
+):
+    """
+    Find the CO2 window that best matches the ICA signal.
+
+    The lag is always non-negative. The ICA signal is retained,
+    and the beginning of the CO2 signal is cut by lag samples.
+
+    Returns the aligned signals and the estimated lag.
+    """
+
+    ica_signal = np.asarray(ica_signal).squeeze()
+    co2_signal = np.asarray(co2_signal).squeeze()
+
+    if ica_signal.ndim != 1 or co2_signal.ndim != 1:
+        raise ValueError(
+            "Both signals must be one-dimensional."
+        )
+
+    n_ica = len(ica_signal)
+    n_co2 = len(co2_signal)
+
+    print("ICA time points:", n_ica)
+    print("CO2-HRF time points:", n_co2)
+
+    if n_co2 < n_ica:
+        raise ValueError(
+            "CO2-HRF is shorter than the ICA signal. "
+            "The requested positive-lag-only alignment "
+            "requires CO2-HRF to be at least as long as ICA."
+        )
+
+    ica_centered = ica_signal - np.mean(ica_signal)
+
+    if np.std(ica_centered) == 0:
+        raise ValueError(
+            "ICA signal has zero variance."
+        )
+
+    best_lag = None
+    best_correlation = None
+
+    # Examine every possible CO2 window that is as long
+    # as the ICA signal. This enforces a non-negative lag.
+    for lag in range(n_co2 - n_ica + 1):
+
+        co2_window = co2_signal[
+            lag:lag + n_ica
+        ]
+
+        co2_centered = (
+            co2_window - np.mean(co2_window)
+        )
+
+        co2_std = np.std(co2_centered)
+
+        if co2_std == 0:
+            continue
+
+        correlation = np.mean(
+            (ica_centered / np.std(ica_centered))
+            * (co2_centered / co2_std)
+        )
+
+        # Select the strongest positive or negative
+        # relationship.
+        if (
+            best_correlation is None
+            or abs(correlation) > abs(best_correlation)
+        ):
+            best_correlation = correlation
+            best_lag = lag
+
+    if best_lag is None:
+        raise ValueError(
+            "Could not estimate a valid lag."
+        )
+
+    # Always cut the CO2 signal, never the ICA signal.
+    aligned_co2 = co2_signal[best_lag:]
+
+    # Match lengths after cutting CO2.
+    aligned_co2 = aligned_co2[:n_ica]
+
+    print("Estimated non-negative lag:", best_lag)
+    print("Aligned ICA length:", len(ica_signal))
+    print("Aligned CO2 length:", len(aligned_co2))
+
+    return (
+        ica_signal,
+        aligned_co2,
+        best_lag,
+        best_correlation
+    )
+
+# ============================================================
+# 14. CORRELATE EVERY ICA COMPONENT
+# ============================================================
+
+def correlate_components(
+    ica_time_series,
+    co2_signal,
+    freq
+):
+
+    results = []
+
+    # Use the actual number of components in melodic_mix.
+    number_components = ica_time_series.shape[1]
+
+    print(
+        "Number of ICA components:",
+        number_components
+    )
+
+    for component in range(number_components):
+
+        print(
+            f"Processing component {component + 1} "
+            f"of {number_components}"
+        )
+
+        ica_signal = ica_time_series[:, component]
+
+        (
+            aligned_ica,
+            aligned_co2,
+            lag_samples,
+            max_cross_correlation
+        ) = align_by_positive_lag(
+            ica_signal,
+            co2_signal
+        )
+
+        lag_seconds = lag_samples / freq
+
+        results.append({
+            "component": component + 1,
+            "max_cross_correlation": max_cross_correlation,
+            "absolute_cross_correlation": abs(
+                max_cross_correlation
+            ),
+            "lag_samples": lag_samples,
+            "lag_seconds": lag_seconds,
+            "aligned_time_points": len(aligned_co2)
+        })
+
+    return pd.DataFrame(results)
+
+# ============================================================
+# 15. SAVE RESULTS
+# ============================================================
+
+def save_results(results, output_file):
+
+    results = results.sort_values(
+        "absolute_cross_correlation",
+        ascending=False
+    )
+
+    results.to_csv(
+        output_file,
+        index=False
+    )
+
+    return results
+
+
+# ============================================================
+# 16. TRANSFORM AVAILABLE NETWORK MASKS WITH ANTS
+# ============================================================
+
+def transform_network_maps(subject):
+
+    """
+    Find all subject-specific functional-network masks and
+    transform them into vessel-reference space.
+
+    This does not assume that the networks are ecn, dna, dnb.
+    """
+
+    subject_number = subject.replace("sub-", "")
+
+    anat_reference = (
+        VESSEL_DIRECTORY
+        / f"sub-{subject_number}"
+        / "ses-7T/reg"
+        / f"sub-{subject_number}_vesselref.nii.gz"
+    )
+
+    t1w_to_t2starw = (
+        VESSEL_DIRECTORY
+        / f"sub-{subject_number}"
+        / "ses-7T/reg"
+        / f"sub-{subject_number}_ses-02_UNIT12vesselref0GenericAffine.mat"
+    )
+
+    t2w_to_t1w = (
+        VESSEL_DIRECTORY
+        / f"sub-{subject_number}"
+        / "ses-02/reg"
+        / f"sub-{subject_number}_ses-02_T2w2UNIT10GenericAffine.mat"
+    )
+
+    t2w_to_func = (
+        VESSEL_DIRECTORY
+        / f"sub-{subject_number}"
+        / "ses-01/reg"
+        / f"sub-{subject_number}_ses-02_T2w2sbref0GenericAffine.mat"
+    )
+
+    required_files = [
+        anat_reference,
+        t1w_to_t2starw,
+        t2w_to_t1w,
+        t2w_to_func
+    ]
+
+    for file in required_files:
+        if not file.exists():
+            print(
+                f"WARNING: ANTs input not found: {file}"
+            )
+            print(
+                f"Skipping mask transformations for {subject}."
+            )
+            return
+
+    if shutil.which("antsApplyTransforms") is None:
+        print(
+            "WARNING: antsApplyTransforms is unavailable. "
+            "Run this script inside the ANTs-enabled container."
+        )
+        return
+
+    # Discover masks for this subject instead of assuming
+    # a fixed set of network names.
+    input_masks = sorted(
+        NETWORK_DIRECTORY.glob(
+            f"map_*_mask_{subject}.nii.gz"
+        )
+    )
+
+    if not input_masks:
+        print(
+            f"No functional-network masks found for {subject} "
+            f"in {NETWORK_DIRECTORY}"
+        )
+        return
+
+    for input_map in input_masks:
+
+        output_map = input_map.with_name(
+            f"{input_map.name[:-7]}_vesselres.nii.gz"
+        )
+
+        # Avoid accidentally transforming an output file again.
+        if input_map.name.endswith("_vesselres.nii.gz"):
+            continue
+
+        command = [
+            "antsApplyTransforms",
+            "-d", "3",
+            "-i", str(input_map),
+            "-r", str(anat_reference),
+            "-o", str(output_map),
+            "-n", "NearestNeighbor",
+            "-t", str(t1w_to_t2starw),
+            "-t", str(t2w_to_t1w),
+            "-t", f"[{t2w_to_func},1]"
+        ]
+
+        print(
+            f"\nTransforming {input_map.name}"
+        )
+
+        try:
+            subprocess.run(
+                command,
+                check=True
+            )
+
+            if output_map.exists():
+                print(
+                    f"Created vessel-space mask: {output_map}"
+                )
+
+        except subprocess.CalledProcessError as error:
+            print(
+                f"ERROR: ANTs failed for {input_map.name}: {error}"
+            )
+
+
+# ============================================================
+# 17. MAIN
+# ============================================================
+
+def main():
+
+    if not BASE_DIRECTORY.exists():
+        raise FileNotFoundError(
+            f"MELODIC base directory not found: {BASE_DIRECTORY}"
+        )
+
+    subjects = sorted(
+        folder.name
+        for folder in BASE_DIRECTORY.iterdir()
+        if folder.is_dir() and folder.name.startswith("sub-")
+    )
+
+    print("\n====================================")
+    print("ICA / PETCO2-HRF ANALYSIS")
+    print("====================================")
+
+    print("Subjects found:", subjects)
+    print("CO2 frequency:", CO2_FREQ, "Hz")
+    print("ICA frequency:", ICA_FREQ, "Hz")
+    print("Target frequency:", TARGET_FREQ, "Hz")
+
+    for subject in subjects:
+
+        print("\n====================================")
+        print(f"Processing {subject}")
+        print("====================================")
+
+        # ----------------------------------------------------
+        # A. Transform available spatial masks
+        # ----------------------------------------------------
+
+        transform_network_maps(subject)
+
+        # ----------------------------------------------------
+        # B. Find MELODIC directory and CO2 file
+        # ----------------------------------------------------
+
+        melodic_directory = (
+            BASE_DIRECTORY
+            / subject
+            / f"{subject}{NUMBER_COMPONENTS}_melodic"
+        )
+
+        co2_file = CO2_DIRECTORY / f"{subject}.csv"
+
+        if not melodic_directory.exists():
+            print(
+                f"WARNING: MELODIC directory not found: "
+                f"{melodic_directory}"
+            )
+            continue
+
+        if not co2_file.exists():
+            print(
+                f"WARNING: CO2 file not found: {co2_file}"
+            )
+            continue
+
+        # ----------------------------------------------------
+        # C. Load ICA data and CO2
+        # ----------------------------------------------------
+
+        spatial_maps = load_spatial_maps(
+            melodic_directory
+        )
+
+        ica_time_series = load_time_series(
+            melodic_directory
+        )
+
+        co2_data = load_co2(co2_file)
+
+        print("Spatial maps shape:", spatial_maps.shape)
+        print("ICA time series shape:", ica_time_series.shape)
+
+        co2_signal = get_co2_signal(co2_data)
+
+        # ----------------------------------------------------
+        # D. Resample ICA to the CO2 sampling frequency
+        # ----------------------------------------------------
+        # TARGET_FREQ = CO2_FREQ, so the CO2 signal itself
+        # is not resampled.
+        # ----------------------------------------------------
+
+        if not np.isclose(ICA_FREQ, TARGET_FREQ):
+
+            ica_time_series = resample_signal_freqs(
+                ica_time_series,
+                ICA_FREQ,
+                TARGET_FREQ,
+                axis=0
+            )
+
+        # ----------------------------------------------------
+        # E. Construct PetCO2-HRF
+        # ----------------------------------------------------
+
+        co2_peaks = detect_co2_peaks(
+            co2_signal,
+            CO2_FREQ
+        )
+
+        outprefix = melodic_directory / f"{subject}_CO2"
+
+        petco2hrf = compute_petco2hrf(
+            co2_signal,
+            co2_peaks,
+            CO2_FREQ,
+            str(outprefix),
+            comp_endtidal=True,
+            response_function="hrf",
+            mode="full"
+        )
+
+        print("ICA shape after resampling:", ica_time_series.shape)
+        print("PetCO2-HRF length:", len(petco2hrf))
+
+        # ----------------------------------------------------
+        # F. Cross-correlate all ICA components
+        # ----------------------------------------------------
+
+        results = correlate_components(
+            ica_time_series,
+            petco2hrf,
+            TARGET_FREQ
+        )
+
+        results.insert(0, "subject", subject)
+
+        # ----------------------------------------------------
+        # G. Save subject results
+        # ----------------------------------------------------
+
+        output_file = (
+            melodic_directory
+            / "ICA_PetCO2_HRF_crosscorrelations.csv"
+        )
+
+        results = save_results(
+            results,
+            output_file
+        )
+
+        print("\nResults:")
+        print(results.to_string(index=False))
+
+        print("\nSaved to:", output_file)
+
+    print("\n====================================")
+    print("ALL SUBJECTS COMPLETE")
+    print("====================================")
+
+
+if __name__ == "__main__":
+    main()
