@@ -80,8 +80,8 @@ do
         # Define directories for the current subject/session
         # ------------------------------------------------
 
-        DATA_DIR="/data/M3PI/derivatives/vessels/${subject}/${session}/func"
-        REG_DIR="/data/M3PI/derivatives/vessels/${subject}/${session}/reg"
+        DATA_DIR="/data/vessels/${subject}/${session}/func"
+        REG_DIR="/data/vessels/${subject}/${session}/reg"
 
         # Location of functional image
         func="${DATA_DIR}/00.${subject}_${session}_task-${task}_optcom_native_preprocessed.nii.gz"
