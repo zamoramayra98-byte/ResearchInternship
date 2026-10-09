@@ -15,6 +15,8 @@ subjects=("sub-01" "sub-02" "sub-03" "sub-04" "sub-05" "sub-06")
 
 sessions=("ses-01" "ses-02" "ses-03" "ses-04" "ses-05" "ses-06" "ses-07" "ses-08")
 
+tasks=("simon" "rest" "breathhold")
+
 # ----------------------------------------------------
 # Define number of ICA components
 # ----------------------------------------------------
@@ -32,10 +34,31 @@ do
     echo "Processing ${subject}"
 
     # Create output directory for subject
-    subject_out="/Neurodata/M3PI/derivatives/Mayra_derivatives/vessels/vessels_melodic/${subject}"
+    subject_out="/data/Mayra_derivatives/vessels/vessels_melodic/${subject}"
 
     mkdir -p "${subject_out}"
 
+
+    # =================================================
+    #  Loop through each task
+    # =================================================
+
+    for task in "${tasks[@]}"
+    do
+
+        echo ""
+        echo "------------------------------------------"
+        echo "Processing ${subject} - ${task}"
+        echo "------------------------------------------"
+
+
+        # ------------------------------------------------
+        # Create task-specific output directory
+        # ------------------------------------------------
+
+        task_out="${subject_out}/${task}"
+
+        mkdir -p "${task_out}"
 
     # ------------------------------------------------
     # 3. Create an empty list for functional files
@@ -57,14 +80,14 @@ do
         # Define directories for the current subject/session
         # ------------------------------------------------
 
-        DATA_DIR="/Neurodata/M3PI/derivatives/vessels/${subject}/${session}/func"
-
+        DATA_DIR="/data/vessels/${subject}/${session}/func"
+        REG_DIR="/data/vessels/${subject}/${session}/reg"
 
         # Location of functional image
-        func="${DATA_DIR}/00.${subject}_${session}_task-simon_optcom_native_preprocessed.nii.gz"
+        func="${DATA_DIR}/00.${subject}_${session}_task-${task}_optcom_native_preprocessed.nii.gz"
 
         # Location of brain mask
-        session_mask="/Neurodata/M3PI/derivatives/vessels/${subject}/${session}/reg/sbref_brain_mask.nii.gz"
+        session_mask="${REG_DIR}/sbref_brain_mask.nii.gz"
 
 
         # --------------------------------------------
@@ -81,100 +104,159 @@ do
         fi
 
 
-        # Add functional image to the list
-        func_list+=("$func")
+            # ------------------------------------------------
+            # Calculate signal percentage change
+            # ------------------------------------------------
+
+            echo "Calculating SPC for ${subject} ${task} ${session}"
 
 
-        # --------------------------------------------
-        # Find a brain mask
-        # --------------------------------------------
+            # Mean functional image
+            mean="${task_out}/${subject}_${session}_${task}_mean.nii.gz"
 
-        if [ -z "$mask" ] && [ -f "$session_mask" ]; then
 
-            mask="$session_mask"
+            # Signal percentage change image
+            spc="${task_out}/${subject}_${session}_${task}_spc.nii.gz"
+
+
+            # Calculate temporal mean
+            fslmaths "$func" \
+                -Tmean "$mean"
+
+
+            # Calculate:
+            # (func - mean) / mean
+
+            fslmaths "$func" \
+                -sub "$mean" \
+                -div "$mean" \
+                "$spc"
+
+
+            echo "Created SPC:"
+            echo "$spc"
+
+
+            # ------------------------------------------------
+            # Add SPC image to functional list
+            # ------------------------------------------------
+
+            func_list+=("$spc")
+
+
+            # ------------------------------------------------
+            # Find a brain mask
+            # ------------------------------------------------
+
+            if [ -z "$mask" ] && [ -f "$session_mask" ]; then
+
+                mask="$session_mask"
+
+                echo "Using brain mask:"
+                echo "$mask"
+
+            fi
+
+        done
+
+
+        # =================================================
+        # 5. Check number of sessions
+        # =================================================
+
+        if [ ${#func_list[@]} -lt 2 ]; then
+
+            echo "Not enough sessions for ${subject} ${task}."
+
+            continue
 
         fi
+
+
+        # =================================================
+        # 6. Check that a mask was found
+        # =================================================
+
+        if [ -z "$mask" ]; then
+
+            echo "No brain mask found for ${subject} ${task}."
+
+            continue
+
+        fi
+
+
+        # =================================================
+        # 7. Concatenate sessions
+        # =================================================
+
+        concatenated="${subject_out}/concatenated_func_${task}.nii.gz"
+
+        echo ""
+        echo "Concatenating ${task} sessions..."
+
+
+        # Get TR from first SPC image
+        TR=$(fslval "${func_list[0]}" pixdim4)
+
+
+        # Combine sessions in time dimension
+        fslmerge -tr \
+            "$concatenated" \
+            "${func_list[@]}" \
+            "$TR"
+
+
+        echo "Created:"
+        echo "$concatenated"
+
+
+        # =================================================
+        # 8. Define MELODIC output
+        # =================================================
+
+        melodic_output="${task_out}/${subject}_${task}${numbercomponents}_melodic"
+
+
+        # =================================================
+        # 9. Run MELODIC
+        # =================================================
+
+        echo ""
+        echo "Running MELODIC..."
+        echo "Output: ${melodic_output}"
+
+
+        melodic \
+            -i "$concatenated" \
+            -o "$melodic_output" \
+            -m "$mask" \
+            --report \
+            --nobet \
+            --dim="$numbercomponents"
+
+
+        echo ""
+        echo "Finished ${subject} - ${task}"
 
     done
 
 
-    # ------------------------------------------------
-    # 5. Check number of sessions
-    # ------------------------------------------------
+    # =================================================
+    # Finished subject
+    # =================================================
 
-    if [ ${#func_list[@]} -lt 2 ]; then
-
-        echo "Not enough sessions."
-
-        continue
-
-    fi
-
-
-    # ------------------------------------------------
-    # 6. Check that a mask was found
-    # ------------------------------------------------
-
-    if [ -z "$mask" ]; then
-
-        echo "No brain mask found for ${subject}."
-
-        continue
-
-    fi
-
-
-    # ------------------------------------------------
-    # 7. Concatenate sessions
-    # ------------------------------------------------
-
-    concatenated="${subject_out}/concatenated_func.nii.gz"
-
-    echo "Concatenating sessions..."
-
-
-    # Get TR from the first functional image
-    TR=$(fslval "${func_list[0]}" pixdim4)
-
-
-    # Combine sessions in the time dimension
-    # and preserve the correct TR
-    fslmerge -tr \
-        "$concatenated" \
-        "${func_list[@]}" \
-        "$TR"
-
-
-    # ------------------------------------------------
-    # Define unique MELODIC output name
-    # ------------------------------------------------
-
-    melodic_output="${subject_out}/${subject}${numbercomponents}_melodic"
-
-    # ------------------------------------------------
-    # 8. Run MELODIC
-    # ------------------------------------------------
-
-    echo "Running MELODIC..."
-    echo "Output: ${melodic_output}"
-
-    melodic \
-        -i "$concatenated" \
-        -o "$melodic_output" \
-        -m "$mask" \
-        --report \
-        --nobet
-        --dim="$numbercomponents"
-
-
+    echo ""
     echo "Finished ${subject}"
+    echo "=========================================="
 
 
 done
 
 
-# ----------------------------------------------------
+# ====================================================
 # 10. Pipeline complete
-# ----------------------------------------------------
+# ====================================================
 
+echo ""
 echo "Pipeline complete."
