@@ -2,179 +2,212 @@
 
 # ====================================================
 # Multi-session ICA Pipeline
+# SPC -> Concatenation -> MELODIC -> IC masks
 # ====================================================
 
-set -e
-
+set -euo pipefail
 
 # ----------------------------------------------------
-# 1. Define subjects and sessions
+# 1. Define subjects, sessions, tasks
 # ----------------------------------------------------
 
 subjects=("sub-01" "sub-02" "sub-03" "sub-04" "sub-05" "sub-06")
 
-sessions=("ses-01" "ses-02" "ses-03" "ses-04" "ses-05" "ses-06" "ses-07" "ses-08")
+sessions=("ses-01" "ses-02" "ses-03" "ses-04" \
+          "ses-05" "ses-06" "ses-07" "ses-08")
 
-# ----------------------------------------------------
-# Define number of ICA components
-# ----------------------------------------------------
+tasks=("simon" "rest" "breathhold")
 
 numbercomponents=20
+threshold=2.3
 
+FUNC_ROOT="/data/vessels"
+OUTPUT_ROOT="/data/Mayra_derivatives/vessels/vessels_melodic"
 
-# ----------------------------------------------------
-# 2. Loop through each subject
-# ----------------------------------------------------
+# ====================================================
+# 2. Loop through subjects
+# ====================================================
 
-for subject in "${subjects[@]}"
-do
+for subject in "${subjects[@]}"; do
 
     echo "Processing ${subject}"
 
-    # Create output directory for subject
-    subject_out="/Neurodata/M3PI/derivatives/Mayra_derivatives/vessels/vessels_melodic/${subject}"
-
+    subject_out="${OUTPUT_ROOT}/${subject}"
     mkdir -p "${subject_out}"
 
+    # =================================================
+    # 3. Loop through tasks
+    # =================================================
 
-    # ------------------------------------------------
-    # 3. Create an empty list for functional files
-    # ------------------------------------------------
+    for task in "${tasks[@]}"; do
 
-    func_list=()
+        echo "Processing ${subject} - ${task}"
 
-    mask=""
+        task_out="${subject_out}/${task}"
+        mkdir -p "${task_out}"
 
-
-    # ------------------------------------------------
-    # 4. Loop through each session
-    # ------------------------------------------------
-
-    for session in "${sessions[@]}"
-    do
+        func_list=()
+        mask=""
 
         # ------------------------------------------------
-        # Define directories for the current subject/session
+        # 4. Loop through sessions and calculate SPC
         # ------------------------------------------------
 
-        DATA_DIR="/Neurodata/M3PI/derivatives/vessels/${subject}/${session}/func"
+        for session in "${sessions[@]}"; do
 
+            DATA_DIR="${FUNC_ROOT}/${subject}/${session}/func"
+            REG_DIR="${FUNC_ROOT}/${subject}/${session}/reg"
 
-        # Location of functional image
-        func="${DATA_DIR}/00.${subject}_${session}_task-simon_optcom_native_preprocessed.nii.gz"
+            func="${DATA_DIR}/00.${subject}_${session}_task-${task}_optcom_native_preprocessed.nii.gz"
+            session_mask="${REG_DIR}/sbref_brain_mask.nii.gz"
 
-        # Location of brain mask
-        session_mask="/Neurodata/M3PI/derivatives/vessels/${subject}/${session}/reg/sbref_brain_mask.nii.gz"
+            if [[ ! -f "${func}" ]]; then
+                echo "Missing functional image: ${func}"
+                continue
+            fi
 
+            echo "Calculating SPC: ${subject} ${session} ${task}"
 
-        # --------------------------------------------
-        # Check whether functional image exists
-        # --------------------------------------------
+            mean="${task_out}/${subject}_${session}_${task}_mean.nii.gz"
+            spc="${task_out}/${subject}_${session}_${task}_spc.nii.gz"
 
-        if [ ! -f "$func" ]; then
+            # Temporal mean of this individual run
+            fslmaths "${func}" -Tmean "${mean}"
 
-            echo "Missing functional image:"
-            echo "$func"
+            # SPC = (func - mean) / mean
+            fslmaths "${func}" \
+                -sub "${mean}" \
+                -div "${mean}" \
+                "${spc}"
 
+            # Add SPC, not original functional data
+            func_list+=("${spc}")
+
+            # Use first available functional-space mask
+            if [[ -z "${mask}" && -f "${session_mask}" ]]; then
+                mask="${session_mask}"
+            fi
+
+        done
+
+        # ------------------------------------------------
+        # 5. Validate inputs
+        # ------------------------------------------------
+
+        if [[ ${#func_list[@]} -lt 2 ]]; then
+            echo "WARNING: Fewer than two runs for ${subject} ${task}; skipping ICA."
             continue
-
         fi
 
-
-        # Add functional image to the list
-        func_list+=("$func")
-
-
-        # --------------------------------------------
-        # Find a brain mask
-        # --------------------------------------------
-
-        if [ -z "$mask" ] && [ -f "$session_mask" ]; then
-
-            mask="$session_mask"
-
+        if [[ -z "${mask}" ]]; then
+            echo "WARNING: No brain mask found for ${subject} ${task}."
+            continue
         fi
+
+        # ------------------------------------------------
+        # 6. Concatenate SPC runs
+        # ------------------------------------------------
+
+        concatenated="${subject_out}/concatenated_func_${task}.nii.gz"
+
+        TR=$(fslval "${func_list[0]}" pixdim4)
+
+        echo "Concatenating SPC runs for ${task}"
+
+        # Preserve your existing fslmerge implementation
+        fslmerge -tr \
+            "${concatenated}" \
+            "${func_list[@]}" \
+            "${TR}"
+
+        # ------------------------------------------------
+        # 7. Run MELODIC
+        # ------------------------------------------------
+
+        melodic_output="${task_out}/${subject}_${task}${numbercomponents}_melodic"
+
+        melodic \
+            -i "${concatenated}" \
+            -o "${melodic_output}" \
+            -m "${mask}" \
+            --report \
+            --nobet \
+            --dim="${numbercomponents}"
+
+        echo "Finished ICA: ${subject} ${task}"
 
     done
 
+    # =================================================
+    # 8. Second pass: create component masks
+    # =================================================
 
-    # ------------------------------------------------
-    # 5. Check number of sessions
-    # ------------------------------------------------
+    for task in "${tasks[@]}"; do
 
-    if [ ${#func_list[@]} -lt 2 ]; then
+        task_out="${subject_out}/${task}"
+        melodic_output="${task_out}/${subject}_${task}${numbercomponents}_melodic"
 
-        echo "Not enough sessions."
+        input="${melodic_output}/melodic_IC.nii.gz"
+        ic_masks="${melodic_output}/IC_masks.nii.gz"
+        split_dir="${melodic_output}/IC_masks_split"
 
-        continue
+        if [[ ! -f "${input}" ]]; then
+            echo "WARNING: Missing ICA maps: ${input}"
+            continue
+        fi
 
-    fi
+        mkdir -p "${split_dir}"
 
+        echo "Thresholding components for ${subject} ${task}"
 
-    # ------------------------------------------------
-    # 6. Check that a mask was found
-    # ------------------------------------------------
+        # Threshold positive ICA values at 2.3 and binarize
+        fslmaths "${input}" \
+            -thr "${threshold}" \
+            -bin \
+            "${ic_masks}"
 
-    if [ -z "$mask" ]; then
+        # Split 4D mask image into separate 3D component masks
+        fslsplit "${ic_masks}" "${split_dir}/IC_mask_" -t
 
-        echo "No brain mask found for ${subject}."
+        # =================================================
+        # 9. Extract Breathhold SPC time series
+        # =================================================
 
-        continue
+        # Apply this task's ICA masks to Breathhold SPC data
+        ts_dir="${melodic_output}/breathhold_timeseries"
+        mkdir -p "${ts_dir}"
 
-    fi
+        for session in "${sessions[@]}"; do
 
+            breathhold_spc="${subject_out}/breathhold/${subject}_${session}_breathhold_spc.nii.gz"
 
-    # ------------------------------------------------
-    # 7. Concatenate sessions
-    # ------------------------------------------------
+            if [[ ! -f "${breathhold_spc}" ]]; then
+                echo "WARNING: Missing Breathhold SPC: ${breathhold_spc}"
+                continue
+            fi
 
-    concatenated="${subject_out}/concatenated_func.nii.gz"
+            for ic_mask in "${split_dir}"/IC_mask_*.nii.gz; do
 
-    echo "Concatenating sessions..."
+                [[ -f "${ic_mask}" ]] || continue
 
+                ic_name=$(basename "${ic_mask}" .nii.gz)
 
-    # Get TR from the first functional image
-    TR=$(fslval "${func_list[0]}" pixdim4)
+                ts_file="${ts_dir}/${subject}_${session}_${task}_${ic_name}.txt"
 
+                fslmeants \
+                    -i "${breathhold_spc}" \
+                    -m "${ic_mask}" \
+                    -o "${ts_file}"
 
-    # Combine sessions in the time dimension
-    # and preserve the correct TR
-    fslmerge -tr \
-        "$concatenated" \
-        "${func_list[@]}" \
-        "$TR"
+            done
+        done
 
+        echo "Finished masks and time-series extraction for ${subject} ${task}"
 
-    # ------------------------------------------------
-    # Define unique MELODIC output name
-    # ------------------------------------------------
+    done
 
-    melodic_output="${subject_out}/${subject}${numbercomponents}_melodic"
-
-    # ------------------------------------------------
-    # 8. Run MELODIC
-    # ------------------------------------------------
-
-    echo "Running MELODIC..."
-    echo "Output: ${melodic_output}"
-
-    melodic \
-        -i "$concatenated" \
-        -o "$melodic_output" \
-        -m "$mask" \
-        --report \
-        --nobet
-        --dim="$numbercomponents"
-
-
-    echo "Finished ${subject}"
-
+    echo "Finished subject ${subject}"
 
 done
-
-
-# ----------------------------------------------------
-# 10. Pipeline complete
-# ----------------------------------------------------
 
 echo "Pipeline complete."
