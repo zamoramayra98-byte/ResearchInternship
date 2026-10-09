@@ -1,0 +1,214 @@
+
+#!/bin/bash
+
+# ====================================================
+# Multi-session ICA Pipeline
+# SPC -> Concatenation -> MELODIC -> IC masks
+# ====================================================
+
+set -euo pipefail
+
+# ----------------------------------------------------
+# 1. Define subjects, sessions, tasks
+# ----------------------------------------------------
+
+subjects=("sub-01" "sub-02" "sub-03" "sub-04" "sub-05" "sub-06")
+
+sessions=("ses-01" "ses-02" "ses-03" "ses-04" \
+          "ses-05" "ses-06" "ses-07" "ses-08")
+
+tasks=("simon" "rest" "breathhold")
+
+numbercomponents=20
+threshold=2.3
+
+FUNC_ROOT="/data/vessels"
+OUTPUT_ROOT="/data/Mayra_derivatives/vessels/vessels_melodic"
+
+# ====================================================
+# 2. Loop through subjects
+# ====================================================
+
+for subject in "${subjects[@]}"; do
+
+    echo "Processing ${subject}"
+
+    subject_out="${OUTPUT_ROOT}/${subject}"
+    mkdir -p "${subject_out}"
+
+    # =================================================
+    # 3. Loop through tasks
+    # =================================================
+
+    for task in "${tasks[@]}"; do
+
+        echo "Processing ${subject} - ${task}"
+
+        task_out="${subject_out}/${task}"
+        mkdir -p "${task_out}"
+
+        func_list=()
+        mask=""
+
+        # ------------------------------------------------
+        # 4. Loop through sessions and calculate SPC
+        # ------------------------------------------------
+
+        for session in "${sessions[@]}"; do
+
+            DATA_DIR="${FUNC_ROOT}/${subject}/${session}/func"
+            REG_DIR="${FUNC_ROOT}/${subject}/${session}/reg"
+
+            func="${DATA_DIR}/00.${subject}_${session}_task-${task}_optcom_native_preprocessed.nii.gz"
+            session_mask="${REG_DIR}/sbref_brain_mask.nii.gz"
+
+            if [[ ! -f "${func}" ]]; then
+                echo "Missing functional image: ${func}"
+                continue
+            fi
+
+            echo "Calculating SPC: ${subject} ${session} ${task}"
+
+            mean="${task_out}/${subject}_${session}_${task}_mean.nii.gz"
+            spc="${task_out}/${subject}_${session}_${task}_spc.nii.gz"
+
+            # Temporal mean of this individual run
+            fslmaths "${func}" -Tmean "${mean}"
+
+            # SPC = (func - mean) / mean
+            fslmaths "${func}" \
+                -sub "${mean}" \
+                -div "${mean}" \
+                "${spc}"
+
+            # Add SPC, not original functional data
+            func_list+=("${spc}")
+
+            # Use first available functional-space mask
+            if [[ -z "${mask}" && -f "${session_mask}" ]]; then
+                mask="${session_mask}"
+            fi
+
+        done
+
+        # ------------------------------------------------
+        # 5. Validate inputs
+        # ------------------------------------------------
+
+        if [[ ${#func_list[@]} -lt 2 ]]; then
+            echo "WARNING: Fewer than two runs for ${subject} ${task}; skipping ICA."
+            continue
+        fi
+
+        if [[ -z "${mask}" ]]; then
+            echo "WARNING: No brain mask found for ${subject} ${task}."
+            continue
+        fi
+
+        # ------------------------------------------------
+        # 6. Concatenate SPC runs
+        # ------------------------------------------------
+
+        concatenated="${subject_out}/concatenated_func_${task}.nii.gz"
+
+        TR=$(fslval "${func_list[0]}" pixdim4)
+
+        echo "Concatenating SPC runs for ${task}"
+
+        # Preserve your existing fslmerge implementation
+        fslmerge -tr \
+            "${concatenated}" \
+            "${func_list[@]}" \
+            "${TR}"
+
+        # ------------------------------------------------
+        # 7. Run MELODIC
+        # ------------------------------------------------
+
+        melodic_output="${task_out}/${subject}_${task}${numbercomponents}_melodic"
+
+        melodic \
+            -i "${concatenated}" \
+            -o "${melodic_output}" \
+            -m "${mask}" \
+            --report \
+            --nobet \
+            --dim="${numbercomponents}"
+
+        echo "Finished ICA: ${subject} ${task}"
+
+    done
+
+    # =================================================
+    # 8. Second pass: create component masks
+    # =================================================
+
+    for task in "${tasks[@]}"; do
+
+        task_out="${subject_out}/${task}"
+        melodic_output="${task_out}/${subject}_${task}${numbercomponents}_melodic"
+
+        input="${melodic_output}/melodic_IC.nii.gz"
+        ic_masks="${melodic_output}/IC_masks.nii.gz"
+        split_dir="${melodic_output}/IC_masks_split"
+
+        if [[ ! -f "${input}" ]]; then
+            echo "WARNING: Missing ICA maps: ${input}"
+            continue
+        fi
+
+        mkdir -p "${split_dir}"
+
+        echo "Thresholding components for ${subject} ${task}"
+
+        # Threshold positive ICA values at 2.3 and binarize
+        fslmaths "${input}" \
+            -thr "${threshold}" \
+            -bin \
+            "${ic_masks}"
+
+        # Split 4D mask image into separate 3D component masks
+        fslsplit "${ic_masks}" "${split_dir}/IC_mask_" -t
+
+        # =================================================
+        # 9. Extract Breathhold SPC time series
+        # =================================================
+
+        # Apply this task's ICA masks to Breathhold SPC data
+        ts_dir="${melodic_output}/breathhold_timeseries"
+        mkdir -p "${ts_dir}"
+
+        for session in "${sessions[@]}"; do
+
+            breathhold_spc="${subject_out}/breathhold/${subject}_${session}_breathhold_spc.nii.gz"
+
+            if [[ ! -f "${breathhold_spc}" ]]; then
+                echo "WARNING: Missing Breathhold SPC: ${breathhold_spc}"
+                continue
+            fi
+
+            for ic_mask in "${split_dir}"/IC_mask_*.nii.gz; do
+
+                [[ -f "${ic_mask}" ]] || continue
+
+                ic_name=$(basename "${ic_mask}" .nii.gz)
+
+                ts_file="${ts_dir}/${subject}_${session}_${task}_${ic_name}.txt"
+
+                fslmeants \
+                    -i "${breathhold_spc}" \
+                    -m "${ic_mask}" \
+                    -o "${ts_file}"
+
+            done
+        done
+
+        echo "Finished masks and time-series extraction for ${subject} ${task}"
+
+    done
+
+    echo "Finished subject ${subject}"
+
+done
+
+echo "Pipeline complete."
