@@ -33,8 +33,14 @@ NUMBER_COMPONENTS = 30
 # /data/Mayra_derivatives/vessels_melodic
 
 BASE_DIRECTORY = Path(
-    "/data/Mayra_derivatives/vessels_melodic"
+    "/data/Mayra_derivatives/vessels/vessels_melodic"
 )
+
+if not BASE_DIRECTORY.is_dir():
+    raise FileNotFoundError(
+        f"MELODIC base directory not found:\n{BASE_DIRECTORY}\n"
+        "Check the Apptainer bind mount and directory."
+    )
 
 
 # Host:
