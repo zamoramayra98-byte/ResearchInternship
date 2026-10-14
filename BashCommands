@@ -223,6 +223,7 @@ for subject in "${subjects[@]}"; do
 
         fslmaths "$ic_maps" -thr 2.3 -bin "$ic_masks"
 
+      
         # ----------------------------------------------------
         # 13. Split 4D component masks into separate 3D masks
         # ----------------------------------------------------
@@ -230,6 +231,86 @@ for subject in "${subjects[@]}"; do
         mkdir -p "$split_dir"
 
         fslsplit "$ic_masks" "${split_dir}/IC_mask_" -t
+
+        # ----------------------------------------------------
+        # 13a. Transform component masks into vessel-reference
+        #      space using ANTs
+        # ----------------------------------------------------
+
+        subject_number="${subject#sub-}"
+
+        anat_reference="${DATA_DIR}/sub-${subject_number}/ses-7T/reg/sub-${subject_number}_vesselref.nii.gz"
+
+        t1w_to_t2starw="${DATA_DIR}/sub-${subject_number}/ses-7T/reg/sub-${subject_number}_ses-02_UNIT12vesselref0GenericAffine.mat"
+
+        t2w_to_t1w="${DATA_DIR}/sub-${subject_number}/ses-02/reg/sub-${subject_number}_ses-02_T2w2UNIT10GenericAffine.mat"
+
+        t2w_to_func="${DATA_DIR}/sub-${subject_number}/ses-01/reg/sub-${subject_number}_ses-02_T2w2sbref0GenericAffine.mat"
+
+        # Store transformed masks separately from the original
+        # functional-space masks.
+        vessel_mask_dir="${melodic_output}/IC_masks_vesselref"
+        mkdir -p "$vessel_mask_dir"
+
+        # Check whether ANTs is available.
+        if ! command -v antsApplyTransforms >/dev/null 2>&1; then
+
+            echo "WARNING: antsApplyTransforms is unavailable."
+            echo "Skipping vessel-reference transformations for ${subject}."
+
+        # Check that all registration inputs exist.
+        elif [[ ! -f "$anat_reference" ||
+                ! -f "$t1w_to_t2starw" ||
+                ! -f "$t2w_to_t1w" ||
+                ! -f "$t2w_to_func" ]]; then
+
+            echo "WARNING: Registration files missing for ${subject}."
+            echo "Required files:"
+            echo "  $anat_reference"
+            echo "  $t1w_to_t2starw"
+            echo "  $t2w_to_t1w"
+            echo "  $t2w_to_func"
+            echo "Skipping vessel-reference transformations."
+
+        else
+
+            for component_mask in "${split_dir}"/IC_mask_*.nii.gz; do
+
+                [[ -f "$component_mask" ]] || continue
+
+                component_name=$(basename "$component_mask" .nii.gz)
+
+                output_mask="${vessel_mask_dir}/${component_name}_vesselres.nii.gz"
+
+                # Avoid repeating completed transformations.
+                if [[ -f "$output_mask" ]]; then
+                    echo "Already transformed: $output_mask"
+                    continue
+                fi
+
+                echo "Transforming ${component_name} to vessel-reference space"
+
+                antsApplyTransforms \
+                    -d 3 \
+                    -i "$component_mask" \
+                    -r "$anat_reference" \
+                    -o "$output_mask" \
+                    -n NearestNeighbor \
+                    -t "$t1w_to_t2starw" \
+                    -t "$t2w_to_t1w" \
+                    -t "[${t2w_to_func},1]"
+
+                if [[ -f "$output_mask" ]]; then
+                    echo "Created transformed mask: $output_mask"
+                else
+                    echo "ERROR: Transformed mask was not created: $output_mask"
+                    exit 1
+                fi
+
+            done
+
+        fi
+
 
         # ----------------------------------------------------
         # 14. Extract component time series from each session's
