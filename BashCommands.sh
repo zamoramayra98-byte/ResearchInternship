@@ -101,13 +101,15 @@ for subject in "${subjects[@]}"; do
 
             echo "Checking ${subject} ${session} ${task}"
 
-            func="${DATA_DIR}/${subject}/${session}/func/00.${subject}_${session}_task-${task}_optcom_native_preprocessed.nii.gz"
+            func_dir="${DATA_DIR}/${subject}/${session}/func"
+
+            func="${func_dir}/00.${subject}_${session}_task-${task}_optcom_native_preprocessed.nii.gz"
 
             session_mask="${DATA_DIR}/${subject}/${session}/reg/sbref_brain_mask.nii.gz"
 
-            if [[ ! -f "$func" ]]; then
-                echo "WARNING: Functional image not found: $func"
-                continue
+            # Select the first available session mask.
+            if [[ -z "$mask" ]]; then
+                mask="$session_mask"
             fi
 
             if [[ ! -f "$session_mask" ]]; then
@@ -115,11 +117,21 @@ for subject in "${subjects[@]}"; do
                 continue
             fi
 
-            # Select the first available session mask.
-            if [[ -z "$mask" ]]; then
-                mask="$session_mask"
-            fi
 
+            if [[ ! -f "$func" ]]; then
+                echo "WARNING: Functional image not found: $func"
+                continue
+            else
+                echo "Nuisance regression for ${subject}, ${session}"
+                fslmaths ${func} -Tmean ${task_out}/${subject}_${session}_${task}_avgfornuisance
+                3dTproject -polort -1 -input ${func} -mask ${mask} \
+                    -ort ${func_dir}/${subject}_${session}_task-${task}_optcom_nuisreg_mat.1D \
+		-prefix ${task_out}/${subject}_${session}_task-${task}_denoised_bold.nii.gz \
+		-overwrite
+                func=${task_out}/${subject}_${session}_task-${task}_denoised_bold.nii.gz
+                fslmaths ${func} -add ${task_out}/${subject}_${session}_${task}_avgfornuisance ${func}
+            fi
+            
             # ------------------------------------------------
             # 7. Calculate SPC
             # SPC = (functional - temporal mean) / temporal mean
