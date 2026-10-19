@@ -13,35 +13,29 @@ from scipy.interpolate import interp1d
 # 1. SETTINGS
 # ============================================================
 
-# MELODIC functional data: TR = 1.5 seconds
 ICA_FREQ = 1 / 1.5
-
-# Target time interval = 0.5 seconds
 TARGET_FREQ = 1 / 0.5
 
 NUMBER_COMPONENTS = 30
+
+TASKS = ("simon", "rest", "breathhold")
 
 
 # ============================================================
 # 2. DIRECTORIES
 # ============================================================
 
+# Matches the Bash OUTPUT_ROOT.
+#
 # Host:
-# /Neurodata/M3PI/derivatives/Mayra_derivatives/vessels_melodic
+# /Neurodata/M3PI/derivatives/Mayra_derivatives/vessels/vessels_melodic
 #
 # Container:
-# /data/Mayra_derivatives/vessels_melodic
+# /data/Mayra_derivatives/vessels/vessels_melodic
 
 BASE_DIRECTORY = Path(
     "/data/Mayra_derivatives/vessels/vessels_melodic"
 )
-
-if not BASE_DIRECTORY.is_dir():
-    raise FileNotFoundError(
-        f"MELODIC base directory not found:\n{BASE_DIRECTORY}\n"
-        "Check the Apptainer bind mount and directory."
-    )
-
 
 # Host:
 # /Neurodata/M3PI/derivatives/func_net_comp
@@ -49,9 +43,7 @@ if not BASE_DIRECTORY.is_dir():
 # Container:
 # /data/func_net_comp
 
-NETWORK_DIRECTORY = Path(
-    "/data/func_net_comp"
-)
+NETWORK_DIRECTORY = Path("/data/func_net_comp")
 
 
 # ============================================================
@@ -59,12 +51,6 @@ NETWORK_DIRECTORY = Path(
 # ============================================================
 
 def load_network_masks(subject):
-    """
-    Find the subject's available network masks.
-
-    Prefer vessel-reference masks if they already exist.
-    No transformations are performed by this script.
-    """
 
     masks = sorted(
         NETWORK_DIRECTORY.glob(
@@ -76,15 +62,12 @@ def load_network_masks(subject):
         print("Using existing vessel-reference masks.")
         return masks
 
-    # Fall back to original masks if no vessel-reference
-    # masks are available.
     masks = sorted(
         NETWORK_DIRECTORY.glob(
             f"map_*_mask_{subject}.nii.gz"
         )
     )
 
-    # Do not include vessel-reference masks twice.
     masks = [
         mask for mask in masks
         if not mask.name.endswith("_vesselres.nii.gz")
@@ -98,13 +81,6 @@ def load_network_masks(subject):
 # ============================================================
 
 def load_ica_time_series(melodic_directory):
-    """
-    Load the MELODIC time series from melodic_mix.
-
-    Expected dimensions:
-        rows    = time points
-        columns = ICA components
-    """
 
     mix_file = melodic_directory / "melodic_mix"
 
@@ -143,14 +119,6 @@ def resample_signal_freqs(
     freq2=TARGET_FREQ,
     axis=0
 ):
-    """
-    Linearly interpolate a signal from freq1 to freq2.
-
-    Original sampling interval: 1.5 seconds
-    Target sampling interval:   0.5 seconds
-
-    No CO2 data are used.
-    """
 
     ts = np.asarray(ts, dtype=float)
 
@@ -171,7 +139,6 @@ def resample_signal_freqs(
 
     original_times = np.arange(n_original) / freq1
 
-    # Include the original start and end time points.
     n_target = int(
         round((n_original - 1) * freq2 / freq1)
     ) + 1
@@ -202,12 +169,6 @@ def resample_signal_freqs(
 # ============================================================
 
 def inspect_network_masks(subject, output_directory):
-    """
-    Summarise available network masks.
-
-    Does not load melodic_IC.nii.gz.
-    Does not transform masks.
-    """
 
     masks = load_network_masks(subject)
 
@@ -248,42 +209,49 @@ def inspect_network_masks(subject, output_directory):
         print("Nonzero voxels:", voxel_count)
         print("Voxel volume (mm3):", voxel_volume)
 
-    output_file = (
-        output_directory / "network_mask_summary.csv"
-    )
+    output_file = output_directory / "network_mask_summary.csv"
 
     pd.DataFrame(mask_results).to_csv(
         output_file,
         index=False
     )
 
-    print("\nMask summary saved to:", output_file)
+    print("Mask summary saved to:", output_file)
 
 
 # ============================================================
-# 7. PROCESS ONE SUBJECT
+# 7. PROCESS ONE SUBJECT AND TASK
 # ============================================================
 
-def process_subject(subject):
+def process_subject_task(subject, task):
 
-    print("\n" + "=" * 55)
-    print(f"Processing {subject}")
-    print("=" * 55)
+    print("\n" + "=" * 60)
+    print(f"Processing {subject} | Task: {task}")
+    print("=" * 60)
 
+    # Matches the Bash directory structure:
+    #
+    # OUTPUT_ROOT / subject / task /
+    #     subject_task30_melodic
+    #
     melodic_directory = (
         BASE_DIRECTORY
         / subject
-        / f"{subject}{NUMBER_COMPONENTS}_melodic"
+        / task
+        / f"{subject}_{task}{NUMBER_COMPONENTS}_melodic"
     )
 
     if not melodic_directory.is_dir():
         print(
-            f"WARNING: MELODIC directory not found:\n"
-            f"{melodic_directory}"
+            "WARNING: MELODIC directory not found:\n"
+            f"{melodic_directory}\n"
+            "Skipping this subject/task."
         )
         return
 
-    # A. Inspect available network masks.
+    print("MELODIC directory:", melodic_directory)
+
+    # A. Inspect network masks.
     inspect_network_masks(
         subject,
         melodic_directory
@@ -295,18 +263,18 @@ def process_subject(subject):
             melodic_directory
         )
     except (FileNotFoundError, ValueError) as error:
-        print(f"WARNING: Skipping {subject}: {error}")
+        print(f"WARNING: Skipping {subject}, {task}: {error}")
         return
 
     # C. Interpolate from 1.5-second to 0.5-second intervals.
     resampled_ica, target_times = resample_signal_freqs(
         ica_time_series,
-        freq1=1 / 1.5,
-        freq2=1 / 0.5,
+        freq1=ICA_FREQ,
+        freq2=TARGET_FREQ,
         axis=0
     )
 
-    # D. Save resampled ICA time series.
+    # D. Save resampled time series in the same MELODIC folder.
     component_names = [
         f"component_{i + 1}"
         for i in range(resampled_ica.shape[1])
@@ -321,17 +289,17 @@ def process_subject(subject):
 
     output_file = (
         melodic_directory
-        / f"{subject}_ICA_timeseries_0.5s.csv"
+        / f"{subject}_{task}_ICA_timeseries_0.5s.csv"
     )
 
     results.to_csv(output_file, index=False)
 
-    print("\nResampled ICA shape:", resampled_ica.shape)
+    print("Resampled ICA shape:", resampled_ica.shape)
     print("Saved:", output_file)
 
 
 # ============================================================
-# 8. MAIN: PROCESS ALL SUBJECTS
+# 8. MAIN
 # ============================================================
 
 def main():
@@ -347,7 +315,7 @@ def main():
         print(
             "WARNING: Network mask directory not found:\n"
             f"{NETWORK_DIRECTORY}\n"
-            "ICA time-series processing can still continue."
+            "ICA time-series processing can continue."
         )
 
     subjects = sorted(
@@ -363,23 +331,29 @@ def main():
         )
         return
 
+    print("Output root:", BASE_DIRECTORY)
     print("Subjects found:", subjects)
+    print("Tasks:", TASKS)
     print("ICA frequency:", ICA_FREQ, "Hz")
     print("Target frequency:", TARGET_FREQ, "Hz")
-    print("Target sampling interval:", 1 / TARGET_FREQ, "seconds")
+    print("Target interval:", 1 / TARGET_FREQ, "seconds")
 
     for subject in subjects:
-        try:
-            process_subject(subject)
-        except Exception as error:
-            print(f"ERROR processing {subject}: {error}")
-            continue
+        for task in TASKS:
+            try:
+                process_subject_task(subject, task)
+            except Exception as error:
+                print(
+                    f"ERROR processing {subject}, {task}: {error}"
+                )
+                continue
 
-    print("\n" + "=" * 55)
-    print("ALL SUBJECTS PROCESSED")
-    print("=" * 55)
+    print("\n" + "=" * 60)
+    print("ALL SUBJECTS AND TASKS PROCESSED")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
     main()
+
 
