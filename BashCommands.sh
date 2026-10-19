@@ -354,18 +354,4 @@ for subject in "${subjects[@]}"; do
 
             done
 
-            # ------------------------------------------------
-            # 15. Interpolate, average repetitions, and calculate
-            #     pairwise cross-correlations using Python
-            # ------------------------------------------------
-
-            echo "Averaging responses and computing cross-correlations"
-
-            python3 - \
-                "$timeseries_dir" \
-                "$analysis_dir" \
-                "$ICA_TR" \
-                "$TARGET_TR" \
-                "$DISCARD_POINTS" \
-                "$WINDOW_POINTS" \
-               
+         
