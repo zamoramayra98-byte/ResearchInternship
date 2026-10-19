@@ -215,6 +215,7 @@ for subject in "${subjects[@]}"; do
 
         task_out="${subject_out}/${task}"
         melodic_output="${task_out}/${subject}_${task}${numbercomponents}_melodic"
+        melodic_stats="${task_out}/${subject}_${task}${numbercomponents}_melodic/stats"
 
         ic_maps="${melodic_output}/melodic_IC.nii.gz"
         ic_masks="${melodic_output}/IC_masks.nii.gz"
@@ -226,22 +227,16 @@ for subject in "${subjects[@]}"; do
             continue
         fi
 
-        # ----------------------------------------------------
-        # 12. Threshold ICA maps at 2.3
-        # ----------------------------------------------------
+		mkdir -p ${split_dir}
 
-        echo "Thresholding ICA maps for ${subject} ${task}"
+		for component_mask in "${melodic_stats}"/thresh_zstat_*.nii.gz; do
 
-        fslmaths "$ic_maps" -thr 2.3 -bin "$ic_masks"
+		    compnum=$( printf "%02d" $(basename ${component_mask#*_zstat} .nii.gz) )
 
-      
-        # ----------------------------------------------------
-        # 13. Split 4D component masks into separate 3D masks
-        # ----------------------------------------------------
-
-        mkdir -p "$split_dir"
-
-        fslsplit "$ic_masks" "${split_dir}/IC_mask_" -t
+		    fslmaths ${component_mask} -bin "${split_dir}"/IC_mask_${compnum}
+		done
+		
+		    
 
         # ----------------------------------------------------
         # 13a. Transform component masks into vessel-reference
