@@ -1,20 +1,21 @@
 #!/bin/bash
 
 # ============================================================
-# Multi-task, multi-session SPC + MELODIC ICA Pipeline
-# Includes --Ostats, component masks, average responses,
-# and pairwise cross-correlation.
+# Multi-subject, multi-session SPC + MELODIC ICA pipeline
+# Creates component masks and extracts Breathhold SPC signals.
+# ANTs transformations have been removed.
 # ============================================================
 
-set -euo pipefail
+set -Eeuo pipefail
+shopt -s nullglob
 
 # ------------------------------------------------------------
-# 1. Define subjects, sessions, and tasks
+# 1. Subjects, sessions, and tasks
 # ------------------------------------------------------------
 
 subjects=("sub-01" "sub-02" "sub-03" "sub-04" "sub-05" "sub-06")
 
-sessions=("ses-01" "ses-02" "ses-03" "ses-04" \
+sessions=("ses-01" "ses-02" "ses-03" "ses-04"
           "ses-05" "ses-06" "ses-07" "ses-08")
 
 tasks=("simon" "rest" "breathhold")
@@ -22,34 +23,29 @@ tasks=("simon" "rest" "breathhold")
 numbercomponents=30
 
 # ------------------------------------------------------------
-# 2. Define paths inside the Apptainer container
-#
-# Bind mounts:
-# -B /Neurodata/M3PI/derivatives:/data
-# -B /home/mayraz/ResearchInternship:/scripts
+# 2. Paths inside Apptainer
 # ------------------------------------------------------------
 
 DATA_DIR="/data/vessels"
 OUTPUT_ROOT="/data/Mayra_derivatives/vessels/vessels_melodic"
 
-# Acquisition sampling interval (assumes TR = 1.5 seconds)
+# Acquisition and post-processing parameters
 ICA_TR=1.5
-
-# Interpolated sampling interval
 TARGET_TR=0.5
 
-# Breathhold response averaging parameters
 DISCARD_POINTS=66
 WINDOW_POINTS=116
 REPETITIONS=6
 
+# Threshold for binarizing each MELODIC component map
+IC_THRESHOLD=2.3
+
 # ------------------------------------------------------------
-# 3. Validate paths and output permissions
+# 3. Validate directories and required commands
 # ------------------------------------------------------------
 
 if [[ ! -d "$DATA_DIR" ]]; then
     echo "ERROR: Input directory not found: $DATA_DIR"
-    echo "Check your Apptainer bind mount."
     exit 1
 fi
 
@@ -57,9 +53,15 @@ mkdir -p "$OUTPUT_ROOT"
 
 if [[ ! -w "$OUTPUT_ROOT" ]]; then
     echo "ERROR: Output directory is not writable: $OUTPUT_ROOT"
-    echo "Check permissions on the host directory mounted as /data."
     exit 1
 fi
+
+for command_name in fslmaths fslmerge fslval melodic fslsplit fslmeants 3dTproject; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        echo "ERROR: Required command not found: $command_name"
+        exit 1
+    fi
+done
 
 echo "Input directory:  $DATA_DIR"
 echo "Output directory: $OUTPUT_ROOT"
@@ -78,7 +80,7 @@ for subject in "${subjects[@]}"; do
     mkdir -p "$subject_out"
 
     # --------------------------------------------------------
-    # 5. Process each task: calculate SPC, concatenate, run ICA
+    # 5. Calculate SPC and run MELODIC for each task
     # --------------------------------------------------------
 
     for task in "${tasks[@]}"; do
@@ -94,7 +96,7 @@ for subject in "${subjects[@]}"; do
         mask=""
 
         # ----------------------------------------------------
-        # 6. Loop through sessions
+        # 6. Process sessions
         # ----------------------------------------------------
 
         for session in "${sessions[@]}"; do
@@ -107,31 +109,61 @@ for subject in "${subjects[@]}"; do
 
             session_mask="${DATA_DIR}/${subject}/${session}/reg/sbref_brain_mask.nii.gz"
 
-            # Select the first available session mask.
-            if [[ -z "$mask" ]]; then
-                mask="$session_mask"
-            fi
-
+            # Check the mask BEFORE selecting it.
             if [[ ! -f "$session_mask" ]]; then
                 echo "WARNING: Brain mask not found: $session_mask"
                 continue
             fi
 
+            # Select the first available valid session mask.
+            if [[ -z "$mask" ]]; then
+                mask="$session_mask"
+            fi
 
             if [[ ! -f "$func" ]]; then
                 echo "WARNING: Functional image not found: $func"
                 continue
-            else
-                echo "Nuisance regression for ${subject}, ${session}"
-                fslmaths ${func} -Tmean ${task_out}/${subject}_${session}_${task}_avgfornuisance
-                3dTproject -polort -1 -input ${func} -mask ${mask} \
-                    -ort ${func_dir}/${subject}_${session}_task-${task}_optcom_nuisreg_mat.1D \
-		-prefix ${task_out}/${subject}_${session}_task-${task}_denoised_bold.nii.gz \
-		-overwrite
-                func=${task_out}/${subject}_${session}_task-${task}_denoised_bold.nii.gz
-                fslmaths ${func} -add ${task_out}/${subject}_${session}_${task}_avgfornuisance ${func}
             fi
-            
+
+            nuisance_file="${func_dir}/${subject}_${session}_task-${task}_optcom_nuisreg_mat.1D"
+
+            if [[ ! -f "$nuisance_file" ]]; then
+                echo "WARNING: Nuisance regression file not found:"
+                echo "  $nuisance_file"
+                echo "Skipping this session."
+                continue
+            fi
+
+            # ------------------------------------------------
+            # 6a. Nuisance regression
+            # ------------------------------------------------
+
+            echo "Nuisance regression: ${subject} ${session} ${task}"
+
+            nuisance_mean="${task_out}/${subject}_${session}_${task}_avgfornuisance.nii.gz"
+
+            denoised="${task_out}/${subject}_${session}_task-${task}_denoised_bold.nii.gz"
+
+            fslmaths "$func" -Tmean "$nuisance_mean"
+
+            3dTproject \
+                -polort -1 \
+                -input "$func" \
+                -mask "$mask" \
+                -ort "$nuisance_file" \
+                -prefix "$denoised" \
+                -overwrite
+
+            if [[ ! -f "$denoised" ]]; then
+                echo "ERROR: Denoised image not created: $denoised"
+                exit 1
+            fi
+
+            # Restore the temporal mean after nuisance regression.
+            fslmaths "$denoised" -add "$nuisance_mean" "$denoised"
+
+            func="$denoised"
+
             # ------------------------------------------------
             # 7. Calculate SPC
             # SPC = (functional - temporal mean) / temporal mean
@@ -171,7 +203,6 @@ for subject in "${subjects[@]}"; do
 
         # ----------------------------------------------------
         # 9. Concatenate SPC runs
-        # Keep the existing fslmerge implementation
         # ----------------------------------------------------
 
         concatenated="${task_out}/concatenated_func_${task}.nii.gz"
@@ -186,7 +217,7 @@ for subject in "${subjects[@]}"; do
             "$TR"
 
         # ----------------------------------------------------
-        # 10. Run MELODIC with --Ostats
+        # 10. Run MELODIC
         # ----------------------------------------------------
 
         melodic_output="${task_out}/${subject}_${task}${numbercomponents}_melodic"
@@ -214,8 +245,8 @@ for subject in "${subjects[@]}"; do
     for task in "${tasks[@]}"; do
 
         task_out="${subject_out}/${task}"
+
         melodic_output="${task_out}/${subject}_${task}${numbercomponents}_melodic"
-        melodic_stats="${task_out}/${subject}_${task}${numbercomponents}_melodic/stats"
 
         ic_maps="${melodic_output}/melodic_IC.nii.gz"
         ic_masks="${melodic_output}/IC_masks.nii.gz"
@@ -227,105 +258,45 @@ for subject in "${subjects[@]}"; do
             continue
         fi
 
-		mkdir -p ${split_dir}
-
-		for component_mask in "${melodic_stats}"/thresh_zstat_*.nii.gz; do
-
-		    compnum=$( printf "%02d" $(basename ${component_mask#*_zstat} .nii.gz) )
-
-		    fslmaths ${component_mask} -bin "${split_dir}"/IC_mask_${compnum}
-		done
-		
-		    
-
         # ----------------------------------------------------
-        # 13a. Transform component masks into vessel-reference
-        #      space using ANTs
+        # 12. Threshold and split the 4D component maps
         # ----------------------------------------------------
 
-        subject_number="${subject#sub-}"
+        mkdir -p "$split_dir"
 
-        anat_reference="${DATA_DIR}/sub-${subject_number}/ses-7T/reg/sub-${subject_number}_vesselref.nii.gz"
+        echo "Thresholding component maps at ${IC_THRESHOLD}"
 
-        t1w_to_t2starw="${DATA_DIR}/sub-${subject_number}/ses-7T/reg/sub-${subject_number}_ses-02_UNIT12vesselref0GenericAffine.mat"
+        fslmaths "$ic_maps" \
+            -thr "$IC_THRESHOLD" \
+            -bin "$ic_masks"
 
-        t2w_to_t1w="${DATA_DIR}/sub-${subject_number}/ses-02/reg/sub-${subject_number}_ses-02_T2w2UNIT10GenericAffine.mat"
+        # Remove old split masks so stale components are not used.
+        rm -f "${split_dir}"/IC_mask_*.nii.gz
 
-        t2w_to_func="${DATA_DIR}/sub-${subject_number}/ses-01/reg/sub-${subject_number}_ses-02_T2w2sbref0GenericAffine.mat"
+        fslsplit "$ic_masks" "${split_dir}/IC_mask_" -t
 
-        # Store transformed masks separately from the original
-        # functional-space masks.
-        vessel_mask_dir="${melodic_output}/IC_masks_vesselref"
-        mkdir -p "$vessel_mask_dir"
+        component_masks=("${split_dir}"/IC_mask_*.nii.gz)
 
-        # Check whether ANTs is available.
-        if ! command -v antsApplyTransforms >/dev/null 2>&1; then
-
-            echo "WARNING: antsApplyTransforms is unavailable."
-            echo "Skipping vessel-reference transformations for ${subject}."
-
-        # Check that all registration inputs exist.
-        elif [[ ! -f "$anat_reference" ||
-                ! -f "$t1w_to_t2starw" ||
-                ! -f "$t2w_to_t1w" ||
-                ! -f "$t2w_to_func" ]]; then
-
-            echo "WARNING: Registration files missing for ${subject}."
-            echo "Required files:"
-            echo "  $anat_reference"
-            echo "  $t1w_to_t2starw"
-            echo "  $t2w_to_t1w"
-            echo "  $t2w_to_func"
-            echo "Skipping vessel-reference transformations."
-
-        else
-
-            for component_mask in "${split_dir}"/IC_mask_*.nii.gz; do
-
-                [[ -f "$component_mask" ]] || continue
-
-                component_name=$(basename "$component_mask" .nii.gz)
-
-                output_mask="${vessel_mask_dir}/${component_name}_vesselres.nii.gz"
-
-                # Avoid repeating completed transformations.
-                if [[ -f "$output_mask" ]]; then
-                    echo "Already transformed: $output_mask"
-                    continue
-                fi
-
-                echo "Transforming ${component_name} to vessel-reference space"
-
-                antsApplyTransforms \
-                    -d 3 \
-                    -i "$component_mask" \
-                    -r "$anat_reference" \
-                    -o "$output_mask" \
-                    -n NearestNeighbor \
-                    -t "$t1w_to_t2starw" \
-                    -t "$t2w_to_t1w" \
-                    -t "[${t2w_to_func},1]"
-
-                if [[ -f "$output_mask" ]]; then
-                    echo "Created transformed mask: $output_mask"
-                else
-                    echo "ERROR: Transformed mask was not created: $output_mask"
-                    exit 1
-                fi
-
-            done
-
+        if [[ "${#component_masks[@]}" -eq 0 ]]; then
+            echo "WARNING: No component masks created for ${subject} ${task}."
+            continue
         fi
 
+        echo "Created ${#component_masks[@]} component masks."
 
         # ----------------------------------------------------
-        # 14. Extract component time series from each session's
-        #     Breathhold SPC data
+        # 13. Extract Breathhold SPC time series
+        # ----------------------------------------------------
+        # Use this task's component masks to sample each session's
+        # Breathhold SPC image.
+        #
+        # No ANTs transformations are performed.
+        # Component masks and SPC images must be in the same
+        # spatial reference for fslmeants results to be valid.
         # ----------------------------------------------------
 
         for session in "${sessions[@]}"; do
 
-            # Created during the SPC step for task=breathhold.
             breathhold_spc="${subject_out}/breathhold/${subject}_${session}_breathhold_spc.nii.gz"
 
             if [[ ! -f "$breathhold_spc" ]]; then
@@ -334,15 +305,15 @@ for subject in "${subjects[@]}"; do
             fi
 
             timeseries_dir="${melodic_output}/breathhold_timeseries/${session}"
+
             analysis_dir="${melodic_output}/breathhold_analysis/${session}"
 
             mkdir -p "$timeseries_dir" "$analysis_dir"
 
-            for component_mask in "${split_dir}"/IC_mask_*.nii.gz; do
-
-                [[ -f "$component_mask" ]] || continue
+            for component_mask in "${component_masks[@]}"; do
 
                 component_name=$(basename "$component_mask" .nii.gz)
+
                 timeseries_file="${timeseries_dir}/${component_name}.txt"
 
                 echo "Extracting ${component_name}: ${subject} ${session} ${task}"
@@ -352,8 +323,18 @@ for subject in "${subjects[@]}"; do
                     -m "$component_mask" \
                     -o "$timeseries_file"
 
+                if [[ ! -s "$timeseries_file" ]]; then
+                    echo "WARNING: Time series is empty: $timeseries_file"
+                fi
+
             done
 
-		done 	
+        done
 
-         
+    done
+
+done
+
+echo "================================================"
+echo "SPC and MELODIC pipeline finished."
+echo "================================================"
