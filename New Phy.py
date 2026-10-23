@@ -30,13 +30,12 @@ N_WINDOWS = 6
 VESSEL_LABELS = None
 
 BASE_DIR = Path(
-    "/Neurodata/M3PI/derivatives/Mayra_derivatives/"
-    "vessels/vessels_melodic"
+    "/data/Mayra_derivatives/vessels/vessels_melodic"
 )
 
+# Change this if your segmentation files are stored elsewhere.
 SEG_DIR = Path(
-    "/Neurodata/M3PI/derivatives/Mayra_derivatives/"
-    "vessels/segmentations"
+    "/data/Mayra_derivatives/vessels/segmentations"
 )
 
 SEG_NAME = "segmentation_mask.nii.gz"
