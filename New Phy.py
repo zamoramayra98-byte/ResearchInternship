@@ -1,347 +1,321 @@
 
 #!/usr/bin/env python3
+"""Input validation and SPC summaries for the M3PI vessel pipeline."""
 
+from __future__ import annotations
+
+import csv
+import logging
+import sys
 from pathlib import Path
-import subprocess
-import itertools
 
-import numpy as np
-import pandas as pd
-import nibabel as nib
-from scipy.interpolate import interp1d
-from scipy.signal import correlate, correlation_lags
+# ---------------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------------
 
+DATA_ROOT = Path("/Neurodata/M3PI/derivatives")
+VESSEL_ROOT = DATA_ROOT / "vessels"
+MELODIC_ROOT = (
+    DATA_ROOT / "Mayra_derivatives" / "vessels" / "vessels_melodic"
+)
 
-# ============================================================
-# 1. SETTINGS AND PATHS
-# ============================================================
-
-BASE_DIR = Path("/data/Mayra_derivatives/vessels/vessels_melodic")
-DATA_DIR = Path("/data/vessels")
-
-# Update if your segmentation files are stored elsewhere.
-SEG_DIR = Path("/data/Mayra_derivatives/vessels/segmentations")
-SEG_NAME = "segmentation_mask.nii.gz"
-
-OUTPUT_DIR = BASE_DIR / "python_analysis"
-
+OUTPUT_DIR = Path.home() / "vessel_analysis_results"
 SUBJECTS = [f"sub-{i:02d}" for i in range(1, 7)]
-SESSIONS = [f"ses-{i:02d}" for i in range(1, 9)]
-TASKS = ("simon", "rest", "breathhold")
+SESSIONS = range(1, 9)
 
-N_COMPONENTS = 30
-ICA_TR = 1.5
-TARGET_TR = 0.5
+MASK_PATTERNS = ("*mask*.nii.gz", "*vessel*.nii.gz", "*seg*.nii.gz")
 
-DISCARD_POINTS = 66
-WINDOW_LENGTH = 116
-N_WINDOWS = 6
+try:
+    import nibabel as nib
+    import numpy as np
+except ImportError:
+    nib = np = None
+
+# ---------------------------------------------------------
+# LOGGING
+# ---------------------------------------------------------
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(
+            OUTPUT_DIR / "vessel_analysis.log",
+            encoding="utf-8",
+        ),
+    ],
+)
+logger = logging.getLogger("vessel_analysis")
 
 
-# ============================================================
-# 2. FILE PATHS
-# ============================================================
+# ---------------------------------------------------------
+# PATHS AND VALIDATION
+# ---------------------------------------------------------
 
-def melodic_dir(subject, task):
+def reference_path(subject: str) -> Path:
     return (
-        BASE_DIR / subject / task
-        / f"{subject}_{task}{N_COMPONENTS}_melodic"
-    )
-
-
-def vessel_reference(subject):
-    return (
-        DATA_DIR / subject / "ses-7T" / "reg"
+        VESSEL_ROOT / subject / "ses-7T" / "reg"
         / f"{subject}_vesselref.nii.gz"
     )
 
 
-def segmentation_file(subject):
-    return SEG_DIR / subject / SEG_NAME
-
-
-def breathhold_spc(subject, session):
+def spc_path(subject: str, session: int) -> Path:
     return (
-        BASE_DIR / subject / "breathhold"
-        / f"{subject}_{session}_breathhold_spc.nii.gz"
+        MELODIC_ROOT / subject / "breathhold"
+        / f"{subject}_ses-{session:02d}_breathhold_spc.nii.gz"
     )
 
 
-def component_number(path):
-    import re
-    match = re.search(r"IC_mask_(\d+)", Path(path).name)
-    if match is None:
-        raise ValueError(f"Cannot identify component number: {path}")
-    return int(match.group(1))
+def registration_files(subject: str) -> list[Path]:
+    directory = reference_path(subject).parent
+    if not directory.is_dir():
+        return []
 
-
-def transform_paths(subject):
-    """ANTs transforms used by the existing registration workflow."""
-    return [
-        DATA_DIR / subject / "ses-7T" / "reg"
-        / f"{subject}_ses-02_UNIT12vesselref0GenericAffine.mat",
-
-        DATA_DIR / subject / "ses-02" / "reg"
-        / f"{subject}_ses-02_T2w2UNIT10GenericAffine.mat",
-
-        DATA_DIR / subject / "ses-01" / "reg"
-        / f"{subject}_ses-02_T2w2sbref0GenericAffine.mat",
-    ]
-
-
-# ============================================================
-# 3. TRANSFORM COMPONENT MASKS TO VESSEL-REFERENCE SPACE
-# ============================================================
-
-def transform_masks(subject, task):
-    directory = melodic_dir(subject, task)
-    source_dir = directory / "IC_masks_split"
-    output_dir = directory / "IC_masks_vesselref"
-
-    reference = vessel_reference(subject)
-    transforms = transform_paths(subject)
-
-    for path in [reference, *transforms]:
-        if not path.is_file():
-            raise FileNotFoundError(f"Missing required file: {path}")
-
-    masks = sorted(source_dir.glob("IC_mask_*.nii.gz"))
-    if not masks:
-        raise FileNotFoundError(f"No component masks found in {source_dir}")
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    for mask in masks:
-        number = component_number(mask)
-        output_mask = (
-            output_dir / f"IC_mask_{number:04d}_vesselres.nii.gz"
+    return sorted(
+        p for p in directory.iterdir()
+        if p.is_file()
+        and (
+            p.name.endswith((".mat", ".txt", ".h5", ".nii"))
+            or p.name.endswith(".nii.gz")
         )
-
-        if output_mask.exists():
-            continue
-
-        command = [
-            "antsApplyTransforms",
-            "-d", "3",
-            "-i", str(mask),
-            "-r", str(reference),
-            "-o", str(output_mask),
-            "-n", "NearestNeighbor",
-            "-t", str(transforms[0]),
-            "-t", str(transforms[1]),
-            "-t", f"[{transforms[2]},1]",
-        ]
-
-        subprocess.run(command, check=True)
-
-    return output_dir
-
-
-# ============================================================
-# 4. CALCULATE COMPONENT DENSITY
-# ============================================================
-
-def calculate_density(subject, task):
-    reference_path = vessel_reference(subject)
-    segmentation_path = segmentation_file(subject)
-    mask_dir = melodic_dir(subject, task) / "IC_masks_vesselref"
-
-    reference_img = nib.load(str(reference_path))
-    segmentation_img = nib.load(str(segmentation_path))
-
-    reference_mask = reference_img.get_fdata() != 0
-    segmentation = segmentation_img.get_fdata() != 0
-
-    if (
-        segmentation.shape != reference_mask.shape
-        or not np.allclose(
-            segmentation_img.affine, reference_img.affine, atol=1e-4
-        )
-    ):
-        raise ValueError(
-            f"{subject}: segmentation must be on the vessel-reference grid."
-        )
-
-    # Segmented vessel voxels inside the analysis mask.
-    denominator_mask = segmentation & reference_mask
-    denominator = np.count_nonzero(denominator_mask)
-
-    if denominator == 0:
-        raise ValueError(f"{subject}: segmentation contains no analysis voxels.")
-
-    rows = []
-
-    for path in sorted(mask_dir.glob("IC_mask_*_vesselres.nii.gz")):
-        image = nib.load(str(path))
-        component = image.get_fdata() != 0
-
-        if (
-            component.shape != reference_mask.shape
-            or not np.allclose(image.affine, reference_img.affine, atol=1e-4)
-        ):
-            raise ValueError(f"Component mask is not in vessel space: {path}")
-
-        overlap = np.count_nonzero(component & denominator_mask)
-
-        rows.append({
-            "subject": subject,
-            "task": task,
-            "component": component_number(path),
-            "overlap_voxels": int(overlap),
-            "segmentation_voxels": int(denominator),
-            "density": overlap / denominator,
-        })
-
-    return rows
-
-
-# ============================================================
-# 5. AVERAGE BREATH-HOLD SPC RESPONSES
-# ============================================================
-
-def average_response(timeseries):
-    """Interpolate, discard the initial samples, and average six windows."""
-    timeseries = np.asarray(timeseries, dtype=float).squeeze()
-
-    if timeseries.ndim != 1 or len(timeseries) < 2:
-        raise ValueError("Timeseries must contain at least two samples.")
-
-    original_time = np.arange(len(timeseries)) * ICA_TR
-    interpolated_time = np.arange(
-        0, original_time[-1] + 1e-9, TARGET_TR
-    )
-
-    interpolated = interp1d(
-        original_time, timeseries, kind="linear"
-    )(interpolated_time)
-
-    required = DISCARD_POINTS + WINDOW_LENGTH * N_WINDOWS
-    if len(interpolated) < required:
-        raise ValueError(
-            f"Only {len(interpolated)} interpolated samples; "
-            f"{required} are required."
-        )
-
-    start = DISCARD_POINTS
-    stop = start + WINDOW_LENGTH * N_WINDOWS
-    windows = interpolated[start:stop].reshape(
-        N_WINDOWS, WINDOW_LENGTH
-    )
-
-    return np.mean(windows, axis=0)
-
-
-# ============================================================
-# 6. CROSS-CORRELATION BETWEEN COMPONENT RESPONSES
-# ============================================================
-
-def cross_correlation(first, second):
-    """Return maximum normalized correlation and its lag in seconds."""
-    first = np.asarray(first, dtype=float)
-    second = np.asarray(second, dtype=float)
-
-    first = first - np.mean(first)
-    second = second - np.mean(second)
-
-    denominator = np.linalg.norm(first) * np.linalg.norm(second)
-    if denominator == 0:
-        return np.nan, np.nan
-
-    correlation = correlate(second, first, mode="full") / denominator
-    lags = correlation_lags(len(second), len(first), mode="full")
-
-    best = np.argmax(correlation)
-
-    return (
-        float(correlation[best]),
-        float(lags[best] * TARGET_TR),
     )
 
 
-# ============================================================
-# 7. RUN ANALYSIS AND SAVE RESULTS
-# ============================================================
+def candidate_masks(subject: str) -> list[Path]:
+    directory = VESSEL_ROOT / subject
+    if not directory.is_dir():
+        return []
 
-def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    files = {
+        p
+        for pattern in MASK_PATTERNS
+        for p in directory.rglob(pattern)
+        if p.is_file()
+        and not p.name.endswith("_vesselref.nii.gz")
+    }
+    return sorted(files)
 
-    density_results = []
-    response_results = []
-    correlation_results = []
 
-    for subject in SUBJECTS:
-        for task in TASKS:
-            print(f"Processing masks: {subject}, {task}")
-
-            transform_masks(subject, task)
-            density_results.extend(calculate_density(subject, task))
-
-            # The Bash pipeline extracts each task's component masks
-            # from each session's breath-hold SPC image.
-            timeseries_root = (
-                melodic_dir(subject, task) / "breathhold_timeseries"
+def validate_environment() -> None:
+    for path in (VESSEL_ROOT, MELODIC_ROOT):
+        if not path.is_dir():
+            raise FileNotFoundError(
+                f"Required dataset directory is unavailable: {path}"
             )
 
-            for session in SESSIONS:
-                require_spc = breathhold_spc(subject, session)
-                if not require_spc.is_file():
-                    print(f"Skipping missing SPC image: {require_spc}")
-                    continue
+    test_file = OUTPUT_DIR / ".write_test"
+    try:
+        test_file.write_text("ok\n", encoding="utf-8")
+        test_file.unlink()
+    except OSError as exc:
+        raise PermissionError(
+            f"Output directory is not writable: {OUTPUT_DIR}"
+        ) from exc
 
-                session_dir = timeseries_root / session
-                files = sorted(session_dir.glob("*.txt"))
+    logger.info("Dataset: %s", DATA_ROOT)
+    logger.info("Output: %s", OUTPUT_DIR)
 
-                if not files:
-                    print(f"Skipping missing timeseries: {session_dir}")
-                    continue
 
-                responses = {}
+# ---------------------------------------------------------
+# NIFTI SUMMARY
+# ---------------------------------------------------------
 
-                for path in files:
-                    component = component_number(path)
-                    values = np.loadtxt(path, dtype=float).squeeze()
-                    response = average_response(values)
-                    responses[component] = response
+def summarize_spc(path: Path) -> dict:
+    result = {
+        "file": str(path),
+        "status": "error",
+        "shape": "",
+        "voxel_count": "",
+        "finite_voxels": "",
+        "mean": "",
+        "std": "",
+        "minimum": "",
+        "maximum": "",
+        "nonzero_voxels": "",
+        "nonzero_fraction": "",
+        "error": "",
+    }
 
-                    for point, value in enumerate(response):
-                        response_results.append({
-                            "subject": subject,
-                            "task": task,
-                            "session": session,
-                            "component": component,
-                            "time_seconds": point * TARGET_TR,
-                            "average_spc": float(value),
-                        })
+    if nib is None or np is None:
+        result.update(
+            status="dependency_missing",
+            error="Install nibabel and numpy to summarize NIfTI images.",
+        )
+        return result
 
-                for first, second in itertools.combinations(
-                    sorted(responses), 2
-                ):
-                    r, shift = cross_correlation(
-                        responses[first], responses[second]
-                    )
+    try:
+        image = nib.load(str(path))
+        data = image.get_fdata(dtype=np.float32)
+        finite = np.isfinite(data)
+        values = data[finite]
 
-                    correlation_results.append({
-                        "subject": subject,
-                        "task": task,
-                        "session": session,
-                        "component_1": first,
-                        "component_2": second,
-                        "correlation_r": r,
-                        "shift_seconds": shift,
-                    })
+        result["shape"] = "x".join(map(str, data.shape))
+        result["voxel_count"] = int(data.size)
+        result["finite_voxels"] = int(values.size)
 
-    pd.DataFrame(density_results).to_csv(
-        OUTPUT_DIR / "component_density.csv", index=False
+        if not values.size:
+            result["error"] = "No finite voxel values."
+            return result
+
+        nonzero = int(np.count_nonzero(values))
+        result.update(
+            mean=float(np.mean(values)),
+            std=float(np.std(values)),
+            minimum=float(np.min(values)),
+            maximum=float(np.max(values)),
+            nonzero_voxels=nonzero,
+            nonzero_fraction=float(nonzero / values.size),
+            status="ok",
+        )
+    except Exception as exc:
+        result["error"] = str(exc)
+        logger.exception("Failed to read %s", path)
+
+    return result
+
+
+# ---------------------------------------------------------
+# AUDIT
+# ---------------------------------------------------------
+
+def audit_subject(subject: str) -> tuple[dict, list[dict]]:
+    ref = reference_path(subject)
+    masks = candidate_masks(subject)
+    transforms = registration_files(subject)
+
+    subject_row = {
+        "subject": subject,
+        "reference_path": str(ref),
+        "reference_exists": ref.is_file(),
+        "candidate_mask_count": len(masks),
+        "candidate_mask_paths": ";".join(map(str, masks)),
+        "registration_file_count": len(transforms),
+        "registration_file_paths": ";".join(map(str, transforms)),
+        "nifti_support": nib is not None and np is not None,
+        "status": (
+            "inputs_discovered"
+            if ref.is_file() and masks
+            else "incomplete_inputs"
+        ),
+    }
+
+    if not ref.is_file():
+        logger.warning("Missing reference: %s", ref)
+    if not masks:
+        logger.warning("%s: no candidate masks found", subject)
+    if not transforms:
+        logger.warning(
+            "%s: no registration files found in %s",
+            subject, ref.parent,
+        )
+
+    spc_rows = []
+
+    for session in SESSIONS:
+        path = spc_path(subject, session)
+
+        if not path.is_file():
+            logger.warning("Missing SPC: %s", path)
+            spc_rows.append({
+                "subject": subject,
+                "session": f"ses-{session:02d}",
+                "file": str(path),
+                "status": "missing",
+                "shape": "",
+                "voxel_count": "",
+                "finite_voxels": "",
+                "mean": "",
+                "std": "",
+                "minimum": "",
+                "maximum": "",
+                "nonzero_voxels": "",
+                "nonzero_fraction": "",
+                "error": "File not found",
+            })
+            continue
+
+        spc_rows.append({
+            "subject": subject,
+            "session": f"ses-{session:02d}",
+            **summarize_spc(path),
+        })
+
+    return subject_row, spc_rows
+
+
+def write_csv(rows: list[dict], filename: str) -> bool:
+    if not rows:
+        logger.error("No records available for %s", filename)
+        return False
+
+    path = OUTPUT_DIR / filename
+    try:
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=list(rows[0]),
+                extrasaction="ignore",
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+
+        logger.info("Saved %d records: %s", len(rows), path)
+        return True
+    except OSError:
+        logger.exception("Could not write %s", path)
+        return False
+
+
+# ---------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------
+
+def main() -> int:
+    validate_environment()
+
+    subject_rows = []
+    spc_rows = []
+
+    for subject in SUBJECTS:
+        try:
+            subject_row, image_rows = audit_subject(subject)
+            subject_rows.append(subject_row)
+            spc_rows.extend(image_rows)
+        except Exception:
+            logger.exception("Audit failed for %s", subject)
+            subject_rows.append({
+                "subject": subject,
+                "reference_path": str(reference_path(subject)),
+                "reference_exists": False,
+                "candidate_mask_count": 0,
+                "candidate_mask_paths": "",
+                "registration_file_count": 0,
+                "registration_file_paths": "",
+                "nifti_support": nib is not None and np is not None,
+                "status": "audit_failed",
+            })
+
+    audit_ok = write_csv(subject_rows, "input_audit.csv")
+    spc_ok = write_csv(spc_rows, "spc_image_summary.csv")
+
+    logger.info(
+        "Audit finished: %d subjects, %d SPC records",
+        len(subject_rows), len(spc_rows),
     )
-    pd.DataFrame(response_results).to_csv(
-        OUTPUT_DIR / "breathhold_average.csv", index=False
-    )
-    pd.DataFrame(correlation_results).to_csv(
-        OUTPUT_DIR / "cross_correlation.csv", index=False
+    logger.warning(
+        "This script audits inputs and summarizes SPC images only. "
+        "It does not calculate vessel density or cross-correlations."
     )
 
-    print(f"Analysis complete. Results saved in: {OUTPUT_DIR}")
+    return 0 if audit_ok and spc_ok else 1
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except Exception:
+        logger.exception("Fatal error")
+        sys.exit(1)
