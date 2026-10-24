@@ -1,59 +1,59 @@
 #!/usr/bin/env python3
-
+ 
 from __future__ import annotations
-
+ 
 import csv
 import logging
 import os
 import re
 import sys
 from pathlib import Path
-
+ 
 import matplotlib
 import nibabel as nib
 import numpy as np
-
+ 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
-
+ 
 # ---------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------
-
+ 
 DATA_ROOT = Path("/Neurodata/M3PI/derivatives")
 VESSEL_ROOT = DATA_ROOT / "vessels"
 MELODIC_ROOT = DATA_ROOT / "Mayra_derivatives" / "vessels" / "vessels_melodic"
 OUTPUT_DIR = Path.home() / "vessel_analysis_results"
-
+ 
 SUBJECTS = [f"sub-{i:02d}" for i in range(1, 7)]
 SESSIONS = [f"ses-{i:02d}" for i in range(1, 9)]
 TASKS = ("rest", "simon", "breathhold")
 NUM_COMPONENTS = 30  # = numbercomponents in the Bash script
-
+ 
 # Vessel segmentation (EDIT: file name is a placeholder)
 SEG_TEMPLATE = "{root}/{sub}/ses-7T/reg/{sub}_vesselseg.nii.gz"
 # Optional whole-brain mask in vessel space, or "" for none
 WHOLEBRAIN_TEMPLATE = ""
-
+ 
 # Breathhold averaging
 TARGET_TR = 0.5       # s, interpolation grid
 DISCARD_POINTS = 66   # 15 s of nothing + 18 s of first paced breathing
 WINDOW_POINTS = 116   # 58 s per repetition (6 repetitions expected)
 MAX_LAG_S = 20.0      # cross-correlation search range
-
+ 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 log = logging.getLogger("vessel_analysis")
-
-
+ 
+ 
 def melodic_dir(sub: str, task: str) -> Path:
     return MELODIC_ROOT / sub / task / f"{sub}_{task}{NUM_COMPONENTS}_melodic"
-
-
+ 
+ 
 def comp_number(path: Path) -> int:
     """1-based component number from 0-based fslsplit names."""
     return int(re.search(r"_(\d+)$", path.name.split(".")[0]).group(1)) + 1
-
-
+ 
+ 
 def write_csv(rows: list[dict], name: str) -> None:
     if not rows:
         log.error("No rows for %s", name)
@@ -64,15 +64,15 @@ def write_csv(rows: list[dict], name: str) -> None:
         writer.writeheader()
         writer.writerows(rows)
     log.info("Saved %d rows: %s", len(rows), OUTPUT_DIR / name)
-
-
+ 
+ 
 # ---------------------------------------------------------
 # Step 6: density
 # ---------------------------------------------------------
-
+ 
 def load_mask(path) -> np.ndarray:
     """Load a NIfTI image as a 3D boolean mask (non-zero voxels).
-
+ 
     Replaces phys2cvr's load_nifti_get_mask(..., is_mask=True, ndim=3),
     which is not installed in the container. A 4D image with a single
     volume is squeezed; anything with more volumes is an error.
@@ -83,16 +83,16 @@ def load_mask(path) -> np.ndarray:
     if data.ndim != 3:
         raise ValueError(f"{path}: expected a 3D mask, got shape {data.shape}")
     return data != 0
-
-
+ 
+ 
 def density(brain_mask_path, vessel_mask_path, wholebrain_mask=None):
     brain_mask = load_mask(brain_mask_path)
-
+ 
     if wholebrain_mask is not None:
         brain_mask = brain_mask & load_mask(wholebrain_mask)
-
+ 
     brain_mask_voxels = np.sum(brain_mask)
-
+ 
     vessel_mask = load_mask(vessel_mask_path)
     if vessel_mask.shape != brain_mask.shape:
         raise ValueError(
@@ -101,14 +101,14 @@ def density(brain_mask_path, vessel_mask_path, wholebrain_mask=None):
         )
     vessel_inside_brain = vessel_mask & brain_mask
     vessel_mask_voxels = np.sum(vessel_inside_brain)
-
+ 
     vascular_density = (
         vessel_mask_voxels / brain_mask_voxels * 100 if brain_mask_voxels else float("nan")
     )
-
+ 
     return brain_mask_voxels, vessel_mask_voxels, vascular_density
-
-
+ 
+ 
 def density_table() -> list[dict]:
     rows = []
     for sub in SUBJECTS:
@@ -135,75 +135,86 @@ def density_table() -> list[dict]:
                     "density_percent": float(dens),
                 })
     return rows
-
-
+ 
+ 
 # ---------------------------------------------------------
 # Step 9: average breathhold response
 # ---------------------------------------------------------
-
+ 
 EXPECTED_WINDOWS = 6
-_warned_runs: set = set()
-
-
-def average_response(series: np.ndarray, tr: float, label: str = "") -> np.ndarray | None:
+ 
+ 
+def run_window_info(n_volumes: int, tr: float) -> dict:
+    """How many complete windows a breathhold run of n_volumes yields."""
+    n_points = len(np.arange(0.0, (n_volumes - 1) * tr + 1e-9, TARGET_TR))
+    usable = max(n_points - DISCARD_POINTS, 0)
+    n_win = usable // WINDOW_POINTS
+    return {
+        "n_volumes": n_volumes,
+        "tr_s": round(tr, 4),
+        "n_points": n_points,
+        "points_needed": DISCARD_POINTS + EXPECTED_WINDOWS * WINDOW_POINTS,
+        "n_windows": n_win,
+        "leftover_points": usable - n_win * WINDOW_POINTS,
+    }
+ 
+ 
+def average_response(series: np.ndarray, tr: float) -> np.ndarray | None:
     """Linear interpolation to TARGET_TR (as in phys2cvr), drop the first
     DISCARD_POINTS, chop into WINDOW_POINTS windows, drop the remainder,
-    average the windows.
-
-    `label` (e.g. "sub-01 ses-03") is only used to say which run a warning
-    refers to; each run is reported once, not once per component."""
+    average the windows. Runs shorter than EXPECTED_WINDOWS are averaged
+    over the complete windows they have (reported once per run by
+    all_responses / window_counts.csv). None if not even one window fits."""
     t_in = np.arange(len(series)) * tr
     t_out = np.arange(0.0, t_in[-1] + 1e-9, TARGET_TR)
     y = np.interp(t_out, t_in, series)[DISCARD_POINTS:]
     n_win = len(y) // WINDOW_POINTS
     if n_win < 1:
-        if label not in _warned_runs:
-            _warned_runs.add(label)
-            log.warning("%s: only %d points left after discarding %d; no complete window",
-                        label, len(y), DISCARD_POINTS)
         return None
-    if n_win != EXPECTED_WINDOWS and label not in _warned_runs:
-        _warned_runs.add(label)
-        need = DISCARD_POINTS + EXPECTED_WINDOWS * WINDOW_POINTS
-        have = len(t_out)
-        log.warning(
-            "%s: %d windows (expected %d). %d volumes at TR=%.3f s -> %d points at %.1f s; "
-            "%d needed (%+d), %d leftover points discarded",
-            label, n_win, EXPECTED_WINDOWS, len(series), tr, have, TARGET_TR,
-            need, have - need, len(y) - n_win * WINDOW_POINTS,
-        )
     return y[: n_win * WINDOW_POINTS].reshape(n_win, WINDOW_POINTS).mean(axis=0)
-
-
-def all_responses() -> dict:
-    """{(subject, task, session): {component: response}}"""
+ 
+ 
+def all_responses() -> tuple[dict, list[dict]]:
+    """Returns ({(subject, task, session): {component: response}},
+    window_rows) where window_rows has one row per breathhold run."""
     out = {}
+    window_rows = []
     for sub in SUBJECTS:
         for ses in SESSIONS:
             spc = MELODIC_ROOT / sub / "breathhold" / f"{sub}_{ses}_breathhold_spc.nii.gz"
             if not spc.is_file():
                 continue
-            tr = float(nib.load(str(spc)).header.get_zooms()[3])
+            hdr = nib.load(str(spc)).header
+            tr = float(hdr.get_zooms()[3])
+            info = run_window_info(int(hdr.get_data_shape()[3]), tr)
+            window_rows.append({"subject": sub, "session": ses, **info})
+            if info["n_windows"] != EXPECTED_WINDOWS:
+                log.warning(
+                    "%s %s: %d window(s) instead of %d (%d volumes, TR=%.3f s -> %d points, "
+                    "%d needed, %d leftover points discarded); averaging the %d available",
+                    sub, ses, info["n_windows"], EXPECTED_WINDOWS, info["n_volumes"], tr,
+                    info["n_points"], info["points_needed"], info["leftover_points"],
+                    info["n_windows"],
+                )
             for task in TASKS:
                 ts_dir = melodic_dir(sub, task) / "breathhold_timeseries" / ses
                 comps = {}
                 for f in sorted(ts_dir.glob("IC_mask_*.txt")):
-                    resp = average_response(np.loadtxt(f, ndmin=1), tr,
-                                            label=f"{sub} {ses} (breathhold run, {task} masks)")
+                    resp = average_response(np.loadtxt(f, ndmin=1), tr)
                     if resp is not None:
                         comps[comp_number(f)] = resp
                 if comps:
                     out[(sub, task, ses)] = comps
-    return out
-
-
+    return out, window_rows
+ 
+ 
 # ---------------------------------------------------------
 # Step 10: cross-correlation between IC time series
 # Every component pair (a < b) within a task/session, on the average
 # breathhold responses. r = signed r at the lag with the largest |r|;
 # shift_s > 0 means component a is delayed relative to b.
 # ---------------------------------------------------------
-
+ 
 def xcorr_peak(a: np.ndarray, b: np.ndarray):
     if a.std() == 0 or b.std() == 0:
         return None
@@ -215,8 +226,8 @@ def xcorr_peak(a: np.ndarray, b: np.ndarray):
     keep = np.abs(lags) * TARGET_TR <= MAX_LAG_S
     i = int(np.argmax(np.abs(c[keep])))
     return float(c[keep][i]), float(lags[keep][i] * TARGET_TR)
-
-
+ 
+ 
 def xcorr_table(responses: dict) -> list[dict]:
     rows = []
     for (sub, task, ses), comps in responses.items():
@@ -231,12 +242,12 @@ def xcorr_table(responses: dict) -> list[dict]:
                         "r": peak[0], "shift_s": peak[1],
                     })
     return rows
-
-
+ 
+ 
 # ---------------------------------------------------------
 # Images
 # ---------------------------------------------------------
-
+ 
 def plot_ica_maps(sub: str, task: str, out_dir: Path) -> None:
     mdir = melodic_dir(sub, task)
     masks_file = mdir / "IC_masks.nii.gz"
@@ -244,7 +255,7 @@ def plot_ica_maps(sub: str, task: str, out_dir: Path) -> None:
         return
     masks = np.asarray(nib.load(str(masks_file)).dataobj) > 0
     underlay = np.asarray(nib.load(str(mdir / "mean.nii.gz")).dataobj)
-
+ 
     n, ncols = masks.shape[3], 6
     nrows = -(-n // ncols)
     fig, axes = plt.subplots(nrows, ncols, figsize=(2.2 * ncols, 2.2 * nrows), squeeze=False)
@@ -261,8 +272,8 @@ def plot_ica_maps(sub: str, task: str, out_dir: Path) -> None:
     fig.tight_layout()
     fig.savefig(out_dir / f"{sub}_{task}_ICA_maps.png", dpi=150)
     plt.close(fig)
-
-
+ 
+ 
 def plot_breathhold(responses: dict, sub: str, task: str, out_dir: Path) -> None:
     per_ses = [c for (s, t, _), c in responses.items() if s == sub and t == task]
     if not per_ses:
@@ -288,26 +299,27 @@ def plot_breathhold(responses: dict, sub: str, task: str, out_dir: Path) -> None
     fig.tight_layout()
     fig.savefig(out_dir / f"{sub}_{task}_breathhold_avg.png", dpi=150)
     plt.close(fig)
-
-
+ 
+ 
 # ---------------------------------------------------------
 # Main
 # ---------------------------------------------------------
-
+ 
 def main() -> None:
     fig_dir = OUTPUT_DIR / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
-
+ 
     write_csv(density_table(), "density.csv")
-
-    responses = all_responses()
+ 
+    responses, window_rows = all_responses()
+    write_csv(window_rows, "window_counts.csv")
     write_csv(xcorr_table(responses), "cross_correlation.csv")
-
+ 
     for sub in SUBJECTS:
         for task in TASKS:
             plot_ica_maps(sub, task, fig_dir)
             plot_breathhold(responses, sub, task, fig_dir)
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
