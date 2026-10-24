@@ -1,0 +1,184 @@
+#!/bin/bash
+
+set -Eeuo pipefail
+shopt -s nullglob
+
+subjects=("sub-01" "sub-02" "sub-03" "sub-04" "sub-05" "sub-06")
+sessions=("ses-01" "ses-02" "ses-03" "ses-04" "ses-05" "ses-06" "ses-07" "ses-08")
+tasks=("simon" "rest" "breathhold")
+numbercomponents=30
+
+DATA_DIR="/Neurodata/M3PI/derivatives/vessels"
+OUTPUT_ROOT="/Neurodata/M3PI/derivatives/Mayra_derivatives/vessels/vessels_melodic"
+
+# ANTs transforms functional space -> vessel space (EDIT; Alesia's code
+# was not available). Placeholders: @SUBJECT@, @SESSION@ (session whose
+# brain mask is used). ANTs applies the LAST transform first; use
+# "[file,1]" for an inverse affine. Empty = skip the vessel-space step.
+TRANSFORM_SPECS=()
+
+if [[ ! -d "$DATA_DIR" ]]; then
+    echo "ERROR: Input directory not found: $DATA_DIR"
+    echo "Is the dataset bound into the container? (see apptainer --bind)"
+    exit 1
+fi
+
+if ! mkdir -p "$OUTPUT_ROOT" 2>/dev/null || [[ ! -w "$OUTPUT_ROOT" ]]; then
+    echo "ERROR: Cannot create/write output directory: $OUTPUT_ROOT"
+    echo "Bind the parent folder writable (no ':ro') when starting Apptainer."
+    exit 1
+fi
+
+for subject in "${subjects[@]}"; do
+
+    subject_out="${OUTPUT_ROOT}/${subject}"
+    vessel_ref="${DATA_DIR}/${subject}/ses-7T/reg/${subject}_vesselref.nii.gz"
+
+    # --------------------------------------------------------
+    # 1-3. SPC, concatenation, MELODIC (all tasks incl. breathhold)
+    # --------------------------------------------------------
+
+    for task in "${tasks[@]}"; do
+
+        echo "== ${subject} ${task} =="
+
+        task_out="${subject_out}/${task}"
+        mkdir -p "$task_out"
+
+        func_list=()
+        mask=""
+        mask_session=""
+
+        for session in "${sessions[@]}"; do
+
+            func_dir="${DATA_DIR}/${subject}/${session}/func"
+            func="${func_dir}/00.${subject}_${session}_task-${task}_optcom_native_preprocessed.nii.gz"
+            session_mask="${DATA_DIR}/${subject}/${session}/reg/sbref_brain_mask.nii.gz"
+            nuisance_file="${func_dir}/${subject}_${session}_task-${task}_optcom_nuisreg_mat.1D"
+
+            if [[ ! -f "$session_mask" || ! -f "$func" || ! -f "$nuisance_file" ]]; then
+                echo "WARNING: missing input for ${subject} ${session} ${task}, skipping"
+                continue
+            fi
+
+            if [[ -z "$mask" ]]; then
+                mask="$session_mask"
+                mask_session="$session"
+            fi
+
+            # Nuisance regression (temporal mean restored afterwards)
+            nuisance_mean="${task_out}/${subject}_${session}_${task}_avgfornuisance.nii.gz"
+            denoised="${task_out}/${subject}_${session}_task-${task}_denoised_bold.nii.gz"
+
+            fslmaths "$func" -Tmean "$nuisance_mean"
+            3dTproject -polort -1 -input "$func" -mask "$mask" \
+                -ort "$nuisance_file" -prefix "$denoised" -overwrite
+            fslmaths "$denoised" -add "$nuisance_mean" "$denoised"
+
+            # SPC = (func - mean) / mean
+            spc="${task_out}/${subject}_${session}_${task}_spc.nii.gz"
+            mean="${task_out}/${subject}_${session}_${task}_mean.nii.gz"
+
+            fslmaths "$denoised" -Tmean "$mean"
+            fslmaths "$denoised" -sub "$mean" -div "$mean" "$spc"
+
+            func_list+=("$spc")
+
+        done
+
+        if [[ "${#func_list[@]}" -lt 2 ]]; then
+            echo "WARNING: fewer than two usable runs for ${subject} ${task}, skipping"
+            continue
+        fi
+
+        echo "$mask_session" > "${task_out}/mask_session.txt"
+
+        concatenated="${task_out}/concatenated_func_${task}.nii.gz"
+        TR=$(fslval "${func_list[0]}" pixdim4)
+        fslmerge -tr "$concatenated" "${func_list[@]}" "$TR"
+
+        melodic -i "$concatenated" \
+            -o "${task_out}/${subject}_${task}${numbercomponents}_melodic" \
+            -m "$mask" --report --nobet --Ostats --dim="$numbercomponents"
+
+    done
+
+    # --------------------------------------------------------
+    # 4-7. Masks, vessel space, split, breathhold time series
+    # --------------------------------------------------------
+
+    for task in "${tasks[@]}"; do
+
+        task_out="${subject_out}/${task}"
+        melodic_output="${task_out}/${subject}_${task}${numbercomponents}_melodic"
+        ic_masks="${melodic_output}/IC_masks.nii.gz"
+        split_dir="${melodic_output}/IC_masks_split"
+
+        if [[ ! -f "${melodic_output}/melodic_IC.nii.gz" ]]; then
+            echo "WARNING: no MELODIC output for ${subject} ${task}, skipping"
+            continue
+        fi
+
+        # 4. Binarize the thresholded maps written by --Ostats
+        #    (thresh_zstatN, merged in numeric order; positive voxels)
+        bin_files=()
+        for (( i = 1; i <= numbercomponents; i++ )); do
+            bin_file="${melodic_output}/IC_bin_$(printf '%04d' "$i").nii.gz"
+            fslmaths "${melodic_output}/stats/thresh_zstat${i}.nii.gz" -thr 0 -bin "$bin_file"
+            bin_files+=("$bin_file")
+        done
+        fslmerge -t "$ic_masks" "${bin_files[@]}"
+
+        # 6. Split into one mask per component (functional space)
+        mkdir -p "$split_dir"
+        rm -f "${split_dir}"/IC_mask_*.nii.gz
+        fslsplit "$ic_masks" "${split_dir}/IC_mask_" -t
+        component_masks=("${split_dir}"/IC_mask_*.nii.gz)
+
+        # 5. Transform to vessel space, then split
+        if [[ "${#TRANSFORM_SPECS[@]}" -gt 0 ]]; then
+            mask_session=$(<"${task_out}/mask_session.txt")
+            transform_args=()
+            for spec in "${TRANSFORM_SPECS[@]}"; do
+                spec="${spec//@SUBJECT@/$subject}"
+                spec="${spec//@SESSION@/$mask_session}"
+                transform_args+=(-t "$spec")
+            done
+
+            vessel_split_dir="${melodic_output}/IC_masks_vessel_split"
+            mkdir -p "$vessel_split_dir"
+            rm -f "${vessel_split_dir}"/IC_mask_vessel_*.nii.gz
+
+            antsApplyTransforms -d 3 -e 3 \
+                -i "$ic_masks" -r "$vessel_ref" \
+                -o "${melodic_output}/IC_masks_vessel.nii.gz" \
+                -n NearestNeighbor "${transform_args[@]}"
+
+            fslsplit "${melodic_output}/IC_masks_vessel.nii.gz" \
+                "${vessel_split_dir}/IC_mask_vessel_" -t
+        else
+            echo "WARNING: TRANSFORM_SPECS empty, no vessel-space masks"
+        fi
+
+        # 7. Average breathhold SPC time series per component
+        for session in "${sessions[@]}"; do
+
+            breathhold_spc="${subject_out}/breathhold/${subject}_${session}_breathhold_spc.nii.gz"
+            [[ -f "$breathhold_spc" ]] || continue
+
+            timeseries_dir="${melodic_output}/breathhold_timeseries/${session}"
+            mkdir -p "$timeseries_dir"
+
+            for component_mask in "${component_masks[@]}"; do
+                name=$(basename "$component_mask" .nii.gz)
+                fslmeants -i "$breathhold_spc" -m "$component_mask" \
+                    -o "${timeseries_dir}/${name}.txt"
+            done
+
+        done
+
+    done
+
+done
+
+echo "Pipeline finished. Next: vessel_analysis.py"
