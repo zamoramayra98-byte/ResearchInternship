@@ -12,7 +12,6 @@ from pathlib import Path
 import matplotlib
 import nibabel as nib
 import numpy as np
-from phys2cvr import io as ng  # provides load_nifti_get_mask
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
@@ -71,20 +70,41 @@ def write_csv(rows: list[dict], name: str) -> None:
 # Step 6: density
 # ---------------------------------------------------------
 
+def load_mask(path) -> np.ndarray:
+    """Load a NIfTI image as a 3D boolean mask (non-zero voxels).
+
+    Replaces phys2cvr's load_nifti_get_mask(..., is_mask=True, ndim=3),
+    which is not installed in the container. A 4D image with a single
+    volume is squeezed; anything with more volumes is an error.
+    """
+    data = np.asarray(nib.load(str(path)).dataobj)
+    if data.ndim == 4 and data.shape[3] == 1:
+        data = data[..., 0]
+    if data.ndim != 3:
+        raise ValueError(f"{path}: expected a 3D mask, got shape {data.shape}")
+    return data != 0
+
+
 def density(brain_mask_path, vessel_mask_path, wholebrain_mask=None):
-    _, brain_mask, _ = ng.load_nifti_get_mask(brain_mask_path, is_mask=True, ndim=3)
+    brain_mask = load_mask(brain_mask_path)
 
     if wholebrain_mask is not None:
-        _, wholebrain_mask, _ = ng.load_nifti_get_mask(wholebrain_mask, is_mask=True, ndim=3)
-        brain_mask = brain_mask * wholebrain_mask
+        brain_mask = brain_mask & load_mask(wholebrain_mask)
 
     brain_mask_voxels = np.sum(brain_mask)
 
-    _, vessel_mask, _ = ng.load_nifti_get_mask(vessel_mask_path, is_mask=True, ndim=3)
-    vessel_inside_brain = vessel_mask * brain_mask
+    vessel_mask = load_mask(vessel_mask_path)
+    if vessel_mask.shape != brain_mask.shape:
+        raise ValueError(
+            f"Shape mismatch: mask {brain_mask.shape} ({brain_mask_path}) vs "
+            f"vessel segmentation {vessel_mask.shape} ({vessel_mask_path})"
+        )
+    vessel_inside_brain = vessel_mask & brain_mask
     vessel_mask_voxels = np.sum(vessel_inside_brain)
 
-    vascular_density = vessel_mask_voxels / brain_mask_voxels * 100
+    vascular_density = (
+        vessel_mask_voxels / brain_mask_voxels * 100 if brain_mask_voxels else float("nan")
+    )
 
     return brain_mask_voxels, vessel_mask_voxels, vascular_density
 
@@ -158,7 +178,7 @@ def all_responses() -> dict:
 
 
 # ---------------------------------------------------------
-# Step 10: cross-correlation between IC time series
+# Cross-correlation between IC time series
 # Every component pair (a < b) within a task/session, on the average
 # breathhold responses. r = signed r at the lag with the largest |r|;
 # shift_s > 0 means component a is delayed relative to b.
