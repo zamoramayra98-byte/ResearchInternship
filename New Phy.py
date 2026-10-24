@@ -141,18 +141,37 @@ def density_table() -> list[dict]:
 # Step 9: average breathhold response
 # ---------------------------------------------------------
 
-def average_response(series: np.ndarray, tr: float) -> np.ndarray | None:
+EXPECTED_WINDOWS = 6
+_warned_runs: set = set()
+
+
+def average_response(series: np.ndarray, tr: float, label: str = "") -> np.ndarray | None:
     """Linear interpolation to TARGET_TR (as in phys2cvr), drop the first
     DISCARD_POINTS, chop into WINDOW_POINTS windows, drop the remainder,
-    average the windows."""
+    average the windows.
+
+    `label` (e.g. "sub-01 ses-03") is only used to say which run a warning
+    refers to; each run is reported once, not once per component."""
     t_in = np.arange(len(series)) * tr
     t_out = np.arange(0.0, t_in[-1] + 1e-9, TARGET_TR)
     y = np.interp(t_out, t_in, series)[DISCARD_POINTS:]
     n_win = len(y) // WINDOW_POINTS
     if n_win < 1:
+        if label not in _warned_runs:
+            _warned_runs.add(label)
+            log.warning("%s: only %d points left after discarding %d; no complete window",
+                        label, len(y), DISCARD_POINTS)
         return None
-    if n_win != 6:
-        log.warning("%d windows (expected 6)", n_win)
+    if n_win != EXPECTED_WINDOWS and label not in _warned_runs:
+        _warned_runs.add(label)
+        need = DISCARD_POINTS + EXPECTED_WINDOWS * WINDOW_POINTS
+        have = len(t_out)
+        log.warning(
+            "%s: %d windows (expected %d). %d volumes at TR=%.3f s -> %d points at %.1f s; "
+            "%d needed (%+d), %d leftover points discarded",
+            label, n_win, EXPECTED_WINDOWS, len(series), tr, have, TARGET_TR,
+            need, have - need, len(y) - n_win * WINDOW_POINTS,
+        )
     return y[: n_win * WINDOW_POINTS].reshape(n_win, WINDOW_POINTS).mean(axis=0)
 
 
@@ -169,7 +188,8 @@ def all_responses() -> dict:
                 ts_dir = melodic_dir(sub, task) / "breathhold_timeseries" / ses
                 comps = {}
                 for f in sorted(ts_dir.glob("IC_mask_*.txt")):
-                    resp = average_response(np.loadtxt(f, ndmin=1), tr)
+                    resp = average_response(np.loadtxt(f, ndmin=1), tr,
+                                            label=f"{sub} {ses} (breathhold run, {task} masks)")
                     if resp is not None:
                         comps[comp_number(f)] = resp
                 if comps:
@@ -178,7 +198,7 @@ def all_responses() -> dict:
 
 
 # ---------------------------------------------------------
-# Cross-correlation between IC time series
+# Step 10: cross-correlation between IC time series
 # Every component pair (a < b) within a task/session, on the average
 # breathhold responses. r = signed r at the lag with the largest |r|;
 # shift_s > 0 means component a is delayed relative to b.
